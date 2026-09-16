@@ -1617,7 +1617,9 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
       return res.end("ok");
     }
-    if (!filePath.startsWith(PUBLIC_DIR)) {
+    const rel = url.pathname === "/" ? "index.html" : url.pathname.replace(/^\/+/, "");
+    let filePath = path.resolve(PUBLIC_DIR, rel);
+    if (!filePath.startsWith(path.resolve(PUBLIC_DIR))) {
       res.writeHead(403);
       return res.end();
     }
