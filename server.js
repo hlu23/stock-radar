@@ -444,13 +444,24 @@ function rawNum(value) {
 
 function packQuote(p) {
   if (!p) return null;
+  const state = p.marketState || "";
+  const pre = /PRE/.test(state) && !/POST/.test(state);
+  const post = /POST/.test(state);
+  const live = pre
+    ? rawNum(p.preMarketPrice)
+    : post
+      ? rawNum(p.postMarketPrice)
+      : rawNum(p.regularMarketPrice ?? p.last);
   return {
-    last: rawNum(p.regularMarketPrice ?? p.last),
+    last: live ?? rawNum(p.regularMarketPrice ?? p.last),
     bid: rawNum(p.bid),
     ask: rawNum(p.ask),
     bidSize: rawNum(p.bidSize),
     askSize: rawNum(p.askSize),
-    volume: rawNum(p.regularMarketVolume),
+    volume: rawNum(p.preMarketVolume ?? p.postMarketVolume ?? p.regularMarketVolume),
+    marketState: state,
+    preMarketPrice: rawNum(p.preMarketPrice),
+    postMarketPrice: rawNum(p.postMarketPrice),
   };
 }
 
@@ -730,9 +741,17 @@ function buyWindow(now, start, end, kr, preStart, preEnd) {
 function applyLiveQuote(bars, meta) {
   const use = bars.map((b) => ({ ...b }));
   const last = use.at(-1);
-  const livePx = meta.regularMarketPrice;
-  if (!last || livePx == null) return use;
-  const liveTs = meta.regularMarketTime || last.t;
+  if (!last) return use;
+  const now = Math.floor(Date.now() / 1000);
+  if (now - last.t <= 120) return use;
+  const state = String(meta.marketState || "").toUpperCase();
+  const livePx = (/PRE/.test(state) && !/POST/.test(state) && meta.preMarketPrice != null)
+    ? meta.preMarketPrice
+    : (/POST/.test(state) && meta.postMarketPrice != null)
+      ? meta.postMarketPrice
+      : meta.regularMarketPrice;
+  if (livePx == null) return use;
+  const liveTs = meta.preMarketTime || meta.postMarketTime || meta.regularMarketTime || last.t;
   if (Math.floor(last.t / 60) === Math.floor(liveTs / 60)) {
     last.c = livePx;
     last.h = Math.max(last.h, livePx);
@@ -748,10 +767,6 @@ function applyLiveQuote(bars, meta) {
       c: livePx,
       v: 0,
     });
-  } else {
-    last.c = livePx;
-    last.h = Math.max(last.h, livePx);
-    last.l = Math.min(last.l, livePx);
   }
   return use;
 }
@@ -829,11 +844,17 @@ function buildIntraday(chart1m, chart1d, quote) {
     : bars;
   let use = sessionBars.length ? sessionBars : bars;
   if (!use.length) return null;
-  use = applyLiveQuote(use, meta);
+  use = applyLiveQuote(use, {
+    ...meta,
+    marketState: quote?.marketState || meta.marketState,
+    preMarketPrice: quote?.preMarketPrice ?? meta.preMarketPrice,
+    postMarketPrice: quote?.postMarketPrice ?? meta.postMarketPrice,
+    regularMarketPrice: quote?.last ?? meta.regularMarketPrice,
+  });
 
   const open = use[0].o;
   const last = use.at(-1);
-  const price = meta.regularMarketPrice ?? last.c;
+  const price = quote?.last ?? last.c ?? meta.regularMarketPrice;
   const high = Math.max(...use.map((b) => b.h));
   const low = Math.min(...use.map((b) => b.l));
   const completedVol = use.slice(0, -1).reduce((s, b) => s + b.v, 0);
@@ -1294,7 +1315,9 @@ async function livePack(symbol, bias, locked) {
     bidSize: quote?.bidSize,
     askSize: quote?.askSize,
     volume: quote?.volume ?? rawNum(c1m.meta?.regularMarketVolume),
-    marketState: quote?.marketState || chartQ?.marketState || "",
+    marketState: quote?.marketState || c1m.meta?.marketState || chartQ?.marketState || "",
+    preMarketPrice: quote?.preMarketPrice ?? rawNum(c1m.meta?.preMarketPrice),
+    postMarketPrice: quote?.postMarketPrice ?? rawNum(c1m.meta?.postMarketPrice),
   };
   const intraday = buildIntraday(c1m, c1d, merged);
   let plan = dayTradePlan(intraday, bias);
@@ -1453,16 +1476,20 @@ async function yahooMinuteChart(symbol) {
 }
 
 function lastMinuteStats(chart) {
-  const bars = barsFromChart(chart).filter((b) => b.c != null && b.v > 0);
-  if (bars.length < 2) return null;
-  const last = bars.at(-1);
-  const prev = bars.at(-2);
-  const hist = bars.slice(-16, -1);
-  const avgVol = hist.length ? hist.reduce((s, b) => s + b.v, 0) / hist.length : last.v;
+  const all = barsFromChart(chart).filter((b) => b.c != null);
+  if (all.length < 2) return null;
+  const now = Math.floor(Date.now() / 1000);
+  const last = all.at(-1);
+  if (now - last.t > 15 * 60) return null;
+  const prev = all.at(-2);
+  const withVol = all.filter((b) => b.v > 0);
+  const hist = withVol.slice(-16, -1);
+  const avgVol = hist.length ? hist.reduce((s, b) => s + b.v, 0) / hist.length : (last.v || null);
   const changePct = prev.c ? ((last.c - prev.c) / prev.c) * 100 : 0;
-  const relVol = avgVol ? last.v / avgVol : null;
-  const volDelta = last.v - avgVol;
-  const volSurgePct = avgVol ? ((last.v - avgVol) / avgVol) * 100 : null;
+  const hasPrint = last.v > 0;
+  const relVol = hasPrint && avgVol ? last.v / avgVol : null;
+  const volDelta = hasPrint && avgVol != null ? last.v - avgVol : null;
+  const volSurgePct = hasPrint && avgVol ? ((last.v - avgVol) / avgVol) * 100 : null;
   const turnover = last.c * last.v;
   return {
     price: last.c,
