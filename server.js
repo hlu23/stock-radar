@@ -450,7 +450,7 @@ function packQuote(p) {
     ask: rawNum(p.ask),
     bidSize: rawNum(p.bidSize),
     askSize: rawNum(p.askSize),
-    marketState: p.marketState || "",
+    volume: rawNum(p.regularMarketVolume),
   };
 }
 
@@ -746,7 +746,7 @@ function applyLiveQuote(bars, meta) {
       h: Math.max(last.c, livePx),
       l: Math.min(last.c, livePx),
       c: livePx,
-      v: last.v,
+      v: 0,
     });
   } else {
     last.c = livePx;
@@ -754,6 +754,57 @@ function applyLiveQuote(bars, meta) {
     last.l = Math.min(last.l, livePx);
   }
   return use;
+}
+
+function nyMinutes(ts) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "numeric",
+    minute: "numeric",
+    hourCycle: "h23",
+  }).formatToParts(new Date(ts * 1000));
+  const hour = Number(parts.find((p) => p.type === "hour")?.value || 0);
+  const minute = Number(parts.find((p) => p.type === "minute")?.value || 0);
+  return hour * 60 + minute;
+}
+
+function barSession(t, preStart, start, end, kr) {
+  if (kr) {
+    if (start && end && t >= start && t < end) return "rth";
+    if (preStart && start && t >= preStart && t < start) return "pre";
+    if (end && t >= end) return "post";
+    return "other";
+  }
+  const mins = nyMinutes(t);
+  if (mins >= 4 * 60 && mins < 9 * 60 + 30) return "pre";
+  if (mins >= 9 * 60 + 30 && mins < 16 * 60) return "rth";
+  if (mins >= 16 * 60 && mins < 20 * 60) return "post";
+  return "other";
+}
+
+function fillMinuteGrid(bars, now) {
+  const end = Math.floor(now / 60) * 60;
+  const startTs = end - 24 * 3600;
+  const byMin = new Map();
+  let seed = null;
+  for (const b of bars) {
+    const t = Math.floor(b.t / 60) * 60;
+    if (t < startTs) seed = b.c;
+    if (t >= startTs && t <= end) byMin.set(t, { ...b, t });
+  }
+  if (seed == null && bars[0]) seed = bars[0].c;
+  const out = [];
+  let px = seed;
+  for (let t = startTs; t <= end; t += 60) {
+    const hit = byMin.get(t);
+    if (hit) {
+      out.push(hit);
+      px = hit.c;
+    } else if (px != null) {
+      out.push({ t, o: px, h: px, l: px, c: px, v: 0, flat: true });
+    }
+  }
+  return out.length ? out : bars;
 }
 
 function buildIntraday(chart1m, chart1d, quote) {
@@ -785,9 +836,18 @@ function buildIntraday(chart1m, chart1d, quote) {
   const price = meta.regularMarketPrice ?? last.c;
   const high = Math.max(...use.map((b) => b.h));
   const low = Math.min(...use.map((b) => b.l));
-  const volume = use.reduce((s, b) => s + b.v, 0);
+  const completedVol = use.slice(0, -1).reduce((s, b) => s + b.v, 0);
+  const quoteVol = rawNum(quote?.volume ?? meta.regularMarketVolume);
+  const state = String(quote?.marketState || meta.marketState || "").toUpperCase();
+  const liveTape = /REGULAR/.test(state) || (/PRE/.test(state) && !/POST/.test(state));
+  if (liveTape && quoteVol != null && quoteVol > 0) {
+    const forming = quoteVol - completedVol;
+    if (forming >= 0) last.v = Math.max(last.v, forming);
+  }
+  const volume = quoteVol != null && quoteVol > 0 ? quoteVol : (completedVol + last.v);
+  const volBar = liveTape ? last : ([...use].reverse().find((b) => b.v > 0) || last);
   const turnover = use.reduce((s, b) => s + b.c * b.v, 0);
-  const lastTurnover = last.c * last.v;
+  const lastTurnover = volBar.c * volBar.v;
   const orBars = use.filter((b) => b.t < (sessionOpen || use[0].t) + orWindow);
   const orPool = orBars.length ? orBars : use.slice(0, 15);
   const orh = Math.max(...orPool.map((b) => b.h));
@@ -820,6 +880,19 @@ function buildIntraday(chart1m, chart1d, quote) {
   const kr = /\.(KS|KQ)$/i.test(meta.symbol || "");
   const session = start && end ? buyWindow(now, start, end, kr, preStart, preEnd) : null;
 
+  let chartBars = fillMinuteGrid(bars, now);
+  if (!chartBars.length) chartBars = use;
+  else chartBars = applyLiveQuote(chartBars, meta);
+  const packBar = (b) => ({
+    time: b.t,
+    open: b.o,
+    high: b.h,
+    low: b.l,
+    close: b.c,
+    volume: b.v,
+    session: barSession(b.t, preStart, start, end, kr),
+  });
+
   return {
     symbol: meta.symbol,
     currency: meta.currency,
@@ -835,8 +908,9 @@ function buildIntraday(chart1m, chart1d, quote) {
     orl,
     volume,
     turnover,
-    lastVolume: last.v,
+    lastVolume: volBar.v,
     lastTurnover,
+    quoteVolume: quoteVol,
     avgVol,
     relVol,
     volSpike,
@@ -858,14 +932,7 @@ function buildIntraday(chart1m, chart1d, quote) {
     kr,
     quote: quote || null,
     exec: executableLong(quote || { last: price, marketState: meta.marketState }, price),
-    candles: use.map((b) => ({
-      time: b.t,
-      open: b.o,
-      high: b.h,
-      low: b.l,
-      close: b.c,
-      volume: b.v,
-    })),
+    candles: chartBars.map(packBar),
   };
 }
 
@@ -1214,7 +1281,7 @@ function candlePayload(chart) {
 
 async function livePack(symbol, bias, locked) {
   const [c1m, c1d, quote] = await Promise.all([
-    yahooChart(symbol, "1m", "1d").catch(() => null),
+    yahooChart(symbol, "1m", "2d").catch(() => null),
     yahooChart(symbol, "1d", "5d").catch(() => null),
     yahooQuote(symbol).catch(() => null),
   ]);
@@ -1226,6 +1293,7 @@ async function livePack(symbol, bias, locked) {
     ask: quote?.ask,
     bidSize: quote?.bidSize,
     askSize: quote?.askSize,
+    volume: quote?.volume ?? rawNum(c1m.meta?.regularMarketVolume),
     marketState: quote?.marketState || chartQ?.marketState || "",
   };
   const intraday = buildIntraday(c1m, c1d, merged);

@@ -15,8 +15,10 @@ let activeBias = "중립";
 let savedTimeRange = null;
 let lockedTrade = null;
 let ignoreRangeEvent = false;
+let lastChartSpan = 0;
 let lastIndicatorSnap = "";
 let lastBuySignal = false;
+let buyArmed = false;
 let newsItems = [];
 let newsFilter = "전체";
 
@@ -69,8 +71,9 @@ const gainersBody = document.getElementById("gainers-body");
 const moreGainers = document.getElementById("more-gainers");
 let gainerTimer;
 let gainerItems = [];
-let gainerShown = 50;
-const PAGE_SIZE = 50;
+let gainerShown = 10;
+const PAGE_SIZE = 10;
+const MAX_GAINERS = 100;
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -107,18 +110,18 @@ async function loadGainers() {
     maxPrice: document.getElementById("maxPrice").value,
     minRel: document.getElementById("minRel").value,
     sort: document.getElementById("sortBy").value,
-    limit: "200",
+    limit: String(MAX_GAINERS),
   });
   boardStatus.textContent = "1분봉 급등주 수집 중…";
   try {
     const res = await fetch("/api/gainers?" + params.toString());
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "급등주 조회 실패");
-    gainerItems = data.items || [];
+    gainerItems = (data.items || []).slice(0, MAX_GAINERS);
     gainerShown = PAGE_SIZE;
     renderGainers();
     const q = boardQuery.value.trim();
-    boardStatus.textContent = `${fmtTime(data.asOf)} · 1분봉 ${data.scanned || 0}종 스캔 · ${data.count}개 중 ${Math.min(gainerShown, gainerItems.length)}개${q ? ` · "${q}"` : ""} · 20초 갱신`;
+    boardStatus.textContent = `${fmtTime(data.asOf)} · 1분봉 ${data.scanned || 0}종 스캔 · ${gainerItems.length}개 중 ${Math.min(gainerShown, gainerItems.length)}개${q ? ` · "${q}"` : ""} · 20초 갱신`;
   } catch (err) {
     boardStatus.textContent = err.message;
     gainersBody.innerHTML = `<tr><td colspan="10" class="empty">${escapeHtml(err.message)}</td></tr>`;
@@ -167,8 +170,8 @@ function renderGainers() {
   moreGainers.textContent = remain > 0 ? `${Math.min(PAGE_SIZE, remain)}개 더 보기` : "";
 }
 
-moreGainers.addEventListener("click", () => {
-  gainerShown += PAGE_SIZE;
+  moreGainers.addEventListener("click", () => {
+  gainerShown = Math.min(gainerShown + PAGE_SIZE, MAX_GAINERS, gainerItems.length);
   renderGainers();
 });
 
@@ -513,14 +516,18 @@ function renderPlan(plan) {
       ind.atr != null && card({ key: "ATR", display: fmtNum(ind.atr) }),
     ], true),
     indGroup("거래량", [
-      ind.lastVolume != null && card({ key: "1분 거래량", display: fmtAmt(ind.lastVolume) }),
+      ind.lastVolume != null && card({
+        key: "1분 거래량",
+        display: fmtAmt(ind.lastVolume),
+        hint: "2초 갱신",
+      }),
       ind.relVol != null && card({
         key: "상대거래량",
         display: `${Number(ind.relVol).toFixed(2)}x`,
         tone: Number(ind.relVol) >= 1.5 ? "up" : "",
       }),
-      ind.lastTurnoverLabel && card({ key: "1분 거래대금", display: String(ind.lastTurnoverLabel) }),
-      ind.volume != null && card({ key: "당일 거래량", display: fmtAmt(ind.volume) }),
+      ind.lastTurnoverLabel && card({ key: "1분 거래대금", display: String(ind.lastTurnoverLabel), hint: "실시간" }),
+      ind.volume != null && card({ key: "당일 거래량", display: fmtAmt(ind.volume), hint: "실시간" }),
       ind.turnoverLabel && card({ key: "당일 거래대금", display: String(ind.turnoverLabel), span: true }),
     ]),
     indGroup("레벨", [
@@ -559,7 +566,7 @@ function ensureChart() {
     priceFormat: { type: "volume" },
     priceScaleId: "",
   });
-  chart.priceScale("").applyOptions({ scaleMargins: { top: 0.78, bottom: 0 } });
+  chart.priceScale("").applyOptions({ scaleMargins: { top: 0.84, bottom: 0 } });
   chart.timeScale().subscribeVisibleTimeRangeChange((range) => {
     if (ignoreRangeEvent || !range) return;
     savedTimeRange = range;
@@ -598,23 +605,29 @@ function drawChart(candles, plan, { resetView = false } = {}) {
     low: c.low,
     close: c.close,
     volume: c.volume || 0,
+    session: c.session,
   }));
   ignoreRangeEvent = true;
   candleSeries.setData(data.map(({ time, open, high, low, close }) => ({ time, open, high, low, close })));
   vwapSeries.setData(vwapPath(data));
   emaSeries.setData(emaPath(data, 9));
-  volumeSeries.setData(data.map((c) => ({
-    time: c.time,
-    value: c.volume,
-    color: c.close >= c.open ? "rgba(62,224,162,0.45)" : "rgba(255,107,122,0.45)",
-  })));
+  volumeSeries.setData(data.map((c) => {
+    const up = c.close >= c.open;
+    let color = up ? "rgba(62,224,162,0.45)" : "rgba(255,107,122,0.45)";
+    if (c.session === "pre") color = "rgba(245,193,92,0.55)";
+    if (c.session === "post") color = "rgba(110,168,255,0.5)";
+    if (c.session === "other" || c.volume === 0) color = "rgba(154,166,200,0.22)";
+    return { time: c.time, value: c.volume, color };
+  }));
   applyLines(plan?.trade || {}, isBuySignal(plan));
-  if (resetView || !keepRange) {
+  const span = data.length > 1 ? data.at(-1).time - data[0].time : 0;
+  if (resetView || !keepRange || (lastChartSpan && Math.abs(span - lastChartSpan) > 6 * 3600)) {
     chart.timeScale().fitContent();
     savedTimeRange = chart.timeScale().getVisibleRange();
   } else {
     chart.timeScale().setVisibleRange(keepRange);
   }
+  lastChartSpan = span;
   ignoreRangeEvent = false;
 }
 
