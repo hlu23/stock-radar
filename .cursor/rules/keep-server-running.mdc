@@ -1,0 +1,12 @@
+---
+description: 대인이 말할 때마다 stock-radar 로컬 서버를 켜고 확인한다
+alwaysApply: true
+---
+
+# Keep the site running
+
+Whenever 대인 sends a message in this repo:
+
+1. Confirm `http://127.0.0.1:8787` is serving. If it is down or on stale code, restart with `node --watch server.js` (Windows: request `all` permissions).
+2. If port 8787 is already taken by an old Node process, kill that PID then start again.
+3. After UI/API changes, hit `/api/gainers` or open the page so they can use it immediately.
