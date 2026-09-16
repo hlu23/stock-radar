@@ -1613,7 +1613,10 @@ const server = http.createServer(async (req, res) => {
       };
       return json(res, 200, await livePack(symbol, bias, locked));
     }
-    let filePath = path.join(PUBLIC_DIR, url.pathname === "/" ? "index.html" : url.pathname);
+    if (url.pathname === "/health") {
+      res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+      return res.end("ok");
+    }
     if (!filePath.startsWith(PUBLIC_DIR)) {
       res.writeHead(403);
       return res.end();
@@ -1629,6 +1632,6 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`stock-radar  http://127.0.0.1:${PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`stock-radar  http://0.0.0.0:${PORT}`);
 });

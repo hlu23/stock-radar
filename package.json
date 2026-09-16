@@ -4,6 +4,9 @@
   "private": true,
   "description": "종목 검색 시 1주일 내 호재/악재를 바로 보여주는 레이더",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
