@@ -4,8 +4,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+loadDotEnv();
 const PUBLIC_DIR = path.join(__dirname, "public");
 const PORT = Number(process.env.PORT || 8787);
+const TOSS_BASE = "https://openapi.tossinvest.com";
+const TOSS_CLIENT_ID = process.env.TOSS_CLIENT_ID || "";
+const TOSS_CLIENT_SECRET = process.env.TOSS_CLIENT_SECRET || "";
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const UA =
@@ -67,6 +71,23 @@ const MIME = {
   ".json": "application/json; charset=utf-8",
 };
 
+function loadDotEnv() {
+  const file = path.join(__dirname, ".env");
+  if (!fs.existsSync(file)) return;
+  for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
+    const text = line.trim();
+    if (!text || text.startsWith("#")) continue;
+    const at = text.indexOf("=");
+    if (at < 1) continue;
+    const key = text.slice(0, at).trim();
+    let value = text.slice(at + 1).trim();
+    if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (process.env[key] == null || process.env[key] === "") process.env[key] = value;
+  }
+}
+
 function json(res, status, body) {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
@@ -120,6 +141,124 @@ async function yahooJson(url) {
   }
   if (!res.ok) throw new Error(`요청 실패 ${res.status}`);
   return res.json();
+}
+
+let tossAuth = { token: "", exp: 0 };
+let tossBarCache = { symbol: "", at: 0, bars: [] };
+
+function unwrapToss(payload) {
+  if (payload?.error) {
+    throw new Error(payload.error.message || payload.error.code || "토스 API 오류");
+  }
+  return payload?.result ?? payload;
+}
+
+function tossTs(value) {
+  if (value == null) return null;
+  if (typeof value === "number") return value > 1e12 ? Math.floor(value / 1000) : Math.floor(value);
+  const ms = Date.parse(String(value));
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+}
+
+async function tossToken() {
+  if (!TOSS_CLIENT_ID || !TOSS_CLIENT_SECRET) return "";
+  if (tossAuth.token && Date.now() < tossAuth.exp - 60_000) return tossAuth.token;
+  const res = await fetch(`${TOSS_BASE}/oauth2/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+    body: new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: TOSS_CLIENT_ID,
+      client_secret: TOSS_CLIENT_SECRET,
+    }),
+  });
+  const data = unwrapToss(await res.json().catch(() => ({})));
+  const token = data.accessToken || data.access_token;
+  if (!res.ok || !token) {
+    throw new Error(data.error_description || data.message || `토스 토큰 실패 ${res.status}`);
+  }
+  const ttl = Number(data.expiresIn || data.expires_in || 1800) * 1000;
+  tossAuth = { token, exp: Date.now() + ttl };
+  return token;
+}
+
+async function tossGet(pathname, params, retried = false) {
+  const token = await tossToken();
+  if (!token) return null;
+  const url = new URL(pathname, TOSS_BASE);
+  for (const [key, value] of Object.entries(params || {})) {
+    if (value != null && value !== "") url.searchParams.set(key, String(value));
+  }
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+  });
+  if (res.status === 401 && !retried) {
+    tossAuth = { token: "", exp: 0 };
+    return tossGet(pathname, params, true);
+  }
+  const data = unwrapToss(await res.json().catch(() => ({})));
+  if (!res.ok) throw new Error(data.message || data.error_description || `토스 조회 실패 ${res.status}`);
+  return data;
+}
+
+function mapTossCandle(row) {
+  const t = tossTs(row.timestamp);
+  const o = Number(row.openPrice);
+  const h = Number(row.highPrice);
+  const l = Number(row.lowPrice);
+  const c = Number(row.closePrice);
+  const v = Number(row.volume) || 0;
+  if (t == null || [o, h, l, c].some((x) => !Number.isFinite(x))) return null;
+  return { t, o, h, l, c, v };
+}
+
+async function tossMinuteBars(symbol) {
+  if (!TOSS_CLIENT_ID || !symbol) return [];
+  if (tossBarCache.symbol === symbol && Date.now() - tossBarCache.at < 15_000) {
+    return tossBarCache.bars;
+  }
+  const cutoff = Math.floor(Date.now() / 1000) - 24 * 3600;
+  const bars = [];
+  let before;
+  for (let page = 0; page < 8; page += 1) {
+    const data = await tossGet("/api/v1/candles", {
+      symbol,
+      interval: "1m",
+      count: 200,
+      before,
+    });
+    const rows = (data?.candles || []).map(mapTossCandle).filter(Boolean);
+    if (!rows.length) break;
+    bars.push(...rows);
+    const oldest = rows.at(-1)?.t ?? rows[0]?.t;
+    before = data?.nextBefore;
+    if (!before || oldest <= cutoff) break;
+  }
+  const uniq = new Map();
+  for (const bar of bars) uniq.set(Math.floor(bar.t / 60) * 60, { ...bar, t: Math.floor(bar.t / 60) * 60 });
+  const out = [...uniq.values()].sort((a, b) => a.t - b.t);
+  tossBarCache = { symbol, at: Date.now(), bars: out };
+  return out;
+}
+
+function blendMinuteBars(yahooBars, tossBars) {
+  const byMin = new Map();
+  for (const bar of yahooBars || []) byMin.set(Math.floor(bar.t / 60) * 60, { ...bar });
+  for (const bar of tossBars || []) {
+    const t = Math.floor(bar.t / 60) * 60;
+    const cur = byMin.get(t);
+    if (!cur) {
+      byMin.set(t, { ...bar, t });
+      continue;
+    }
+    const volume = Math.max(cur.v || 0, bar.v || 0);
+    if ((cur.v === 0 || cur.flat) && bar.c != null) {
+      byMin.set(t, { ...bar, t, v: volume, flat: false });
+    } else {
+      byMin.set(t, { ...cur, v: volume });
+    }
+  }
+  return [...byMin.values()].sort((a, b) => a.t - b.t);
 }
 
 async function fetchText(url) {
@@ -458,7 +597,11 @@ function packQuote(p) {
     ask: rawNum(p.ask),
     bidSize: rawNum(p.bidSize),
     askSize: rawNum(p.askSize),
-    volume: rawNum(p.preMarketVolume ?? p.postMarketVolume ?? p.regularMarketVolume),
+    volume: pre
+      ? (p.preMarketVolume > 0 ? rawNum(p.preMarketVolume) : null)
+      : post
+        ? (p.postMarketVolume > 0 ? rawNum(p.postMarketVolume) : null)
+        : rawNum(p.regularMarketVolume),
     marketState: state,
     preMarketPrice: rawNum(p.preMarketPrice),
     postMarketPrice: rawNum(p.postMarketPrice),
@@ -742,25 +885,29 @@ function applyLiveQuote(bars, meta) {
   const use = bars.map((b) => ({ ...b }));
   const last = use.at(-1);
   if (!last) return use;
-  const now = Math.floor(Date.now() / 1000);
-  if (now - last.t <= 120) return use;
   const state = String(meta.marketState || "").toUpperCase();
   const livePx = (/PRE/.test(state) && !/POST/.test(state) && meta.preMarketPrice != null)
     ? meta.preMarketPrice
     : (/POST/.test(state) && meta.postMarketPrice != null)
       ? meta.postMarketPrice
-      : meta.regularMarketPrice;
+      : (meta.regularMarketPrice ?? meta.last);
   if (livePx == null) return use;
-  const liveTs = meta.preMarketTime || meta.postMarketTime || meta.regularMarketTime || last.t;
-  if (Math.floor(last.t / 60) === Math.floor(liveTs / 60)) {
-    last.c = livePx;
-    last.h = Math.max(last.h, livePx);
-    last.l = Math.min(last.l, livePx);
+  const now = Math.floor(Date.now() / 1000);
+  const liveTs = meta.preMarketTime || meta.postMarketTime || meta.regularMarketTime || now;
+  const sameMinute = Math.floor(last.t / 60) === Math.floor(Math.max(liveTs, now) / 60);
+  const stale = now - last.t > 120;
+  const flatDrift = last.flat && Math.abs(last.c - livePx) > Math.max(livePx * 1e-4, 0.0001);
+  if (sameMinute || last.flat) {
+    if (sameMinute || flatDrift || stale) {
+      last.c = livePx;
+      last.h = Math.max(last.h, livePx);
+      last.l = Math.min(last.l, livePx);
+    }
     return use;
   }
-  if (liveTs > last.t) {
+  if (liveTs > last.t || stale) {
     use.push({
-      t: liveTs,
+      t: Math.floor(Math.max(liveTs, now) / 60) * 60,
       o: last.c,
       h: Math.max(last.c, livePx),
       l: Math.min(last.c, livePx),
@@ -769,6 +916,14 @@ function applyLiveQuote(bars, meta) {
     });
   }
   return use;
+}
+
+function tapeSessionNow() {
+  const mins = nyMinutes(Math.floor(Date.now() / 1000));
+  if (mins >= 4 * 60 && mins < 9 * 60 + 30) return "PRE";
+  if (mins >= 9 * 60 + 30 && mins < 16 * 60) return "REGULAR";
+  if (mins >= 16 * 60 && mins < 20 * 60) return "POST";
+  return "CLOSED";
 }
 
 function nyMinutes(ts) {
@@ -822,10 +977,10 @@ function fillMinuteGrid(bars, now) {
   return out.length ? out : bars;
 }
 
-function buildIntraday(chart1m, chart1d, quote) {
+function buildIntraday(chart1m, chart1d, quote, tossBars) {
   if (!chart1m) return null;
   const meta = chart1m.meta || {};
-  const bars = barsFromChart(chart1m);
+  const bars = blendMinuteBars(barsFromChart(chart1m), tossBars);
   const start = sessionStart(chart1m);
   const end = meta.currentTradingPeriod?.regular?.end
     || meta.regularMarketTime
@@ -858,10 +1013,15 @@ function buildIntraday(chart1m, chart1d, quote) {
   const high = Math.max(...use.map((b) => b.h));
   const low = Math.min(...use.map((b) => b.l));
   const completedVol = use.slice(0, -1).reduce((s, b) => s + b.v, 0);
-  const quoteVol = rawNum(quote?.volume ?? meta.regularMarketVolume);
   const state = String(quote?.marketState || meta.marketState || "").toUpperCase();
-  const liveTape = /REGULAR/.test(state) || (/PRE/.test(state) && !/POST/.test(state));
-  if (liveTape && quoteVol != null && quoteVol > 0) {
+  const inPost = /POST/.test(state);
+  const inPreState = /PRE/.test(state) && !inPost;
+  const quoteVol = inPreState || inPost
+    ? rawNum(quote?.volume)
+    : rawNum(quote?.volume ?? meta.regularMarketVolume);
+  const liveTape = /REGULAR/.test(state) || inPreState;
+  const tossTape = (tossBars || []).some((b) => b.v > 0);
+  if (!tossTape && liveTape && quoteVol != null && quoteVol > 0) {
     const forming = quoteVol - completedVol;
     if (forming >= 0) last.v = Math.max(last.v, forming);
   }
@@ -886,7 +1046,7 @@ function buildIntraday(chart1m, chart1d, quote) {
   const avg1mVol = lookback.length
     ? lookback.reduce((s, b) => s + b.v, 0) / lookback.length
     : last.v;
-  const volSpike = avg1mVol ? last.v / avg1mVol : 1;
+  const volSpike = avg1mVol && last.v > 0 ? last.v / avg1mVol : null;
 
   const daily = chart1d ? barsFromChart(chart1d) : [];
   const prev = meta.chartPreviousClose ?? daily.at(-2)?.c ?? open;
@@ -896,14 +1056,23 @@ function buildIntraday(chart1m, chart1d, quote) {
   const elapsedMin = Math.max((last.t - (sessionOpen || use[0].t)) / 60, 1);
   const sessionMin = inPre ? 330 : 390;
   const expectedVol = avgVol ? avgVol * (elapsedMin / sessionMin) : null;
-  const relVol = expectedVol ? volume / expectedVol : (avgVol ? volume / avgVol : null);
+  const relVol = volume > 0
+    ? (expectedVol ? volume / expectedVol : (avgVol ? volume / avgVol : null))
+    : null;
 
   const kr = /\.(KS|KQ)$/i.test(meta.symbol || "");
   const session = start && end ? buyWindow(now, start, end, kr, preStart, preEnd) : null;
 
+  const liveMeta = {
+    ...meta,
+    marketState: quote?.marketState || meta.marketState,
+    preMarketPrice: quote?.preMarketPrice ?? meta.preMarketPrice,
+    postMarketPrice: quote?.postMarketPrice ?? meta.postMarketPrice,
+    regularMarketPrice: quote?.last ?? meta.regularMarketPrice,
+  };
   let chartBars = fillMinuteGrid(bars, now);
   if (!chartBars.length) chartBars = use;
-  else chartBars = applyLiveQuote(chartBars, meta);
+  else chartBars = applyLiveQuote(chartBars, liveMeta);
   const packBar = (b) => ({
     time: b.t,
     open: b.o,
@@ -918,7 +1087,7 @@ function buildIntraday(chart1m, chart1d, quote) {
     symbol: meta.symbol,
     currency: meta.currency,
     exchange: meta.exchangeName,
-    marketState: meta.marketState,
+    marketState: quote?.marketState || meta.marketState,
     price,
     prev,
     open,
@@ -1247,7 +1416,7 @@ function dayTradePlan(intraday, bias) {
     stoch: intraday.stoch != null ? Number(intraday.stoch.toFixed(1)) : null,
     volume: intraday.volume,
     lastVolume: intraday.lastVolume,
-    volSpike: Number(intraday.volSpike.toFixed(2)),
+    volSpike: intraday.volSpike != null ? Number(intraday.volSpike.toFixed(2)) : null,
     relVol: intraday.relVol != null ? Number(intraday.relVol.toFixed(2)) : null,
     turnover: intraday.turnover,
     lastTurnover: intraday.lastTurnover,
@@ -1301,10 +1470,14 @@ function candlePayload(chart) {
 }
 
 async function livePack(symbol, bias, locked) {
-  const [c1m, c1d, quote] = await Promise.all([
+  const [c1m, c1d, quote, tossBars] = await Promise.all([
     yahooChart(symbol, "1m", "2d").catch(() => null),
     yahooChart(symbol, "1d", "5d").catch(() => null),
     yahooQuote(symbol).catch(() => null),
+    tossMinuteBars(symbol).catch((err) => {
+      console.warn("toss candles:", err.message);
+      return [];
+    }),
   ]);
   if (!c1m) throw new Error("1분봉을 못 가져왔습니다.");
   const chartQ = packQuote(c1m.meta);
@@ -1314,12 +1487,12 @@ async function livePack(symbol, bias, locked) {
     ask: quote?.ask,
     bidSize: quote?.bidSize,
     askSize: quote?.askSize,
-    volume: quote?.volume ?? rawNum(c1m.meta?.regularMarketVolume),
+    volume: quote?.volume,
     marketState: quote?.marketState || c1m.meta?.marketState || chartQ?.marketState || "",
     preMarketPrice: quote?.preMarketPrice ?? rawNum(c1m.meta?.preMarketPrice),
     postMarketPrice: quote?.postMarketPrice ?? rawNum(c1m.meta?.postMarketPrice),
   };
-  const intraday = buildIntraday(c1m, c1d, merged);
+  const intraday = buildIntraday(c1m, c1d, merged, tossBars);
   let plan = dayTradePlan(intraday, bias);
   if (locked?.buyPrice != null || locked?.sellPrice != null) {
     plan = applyLockedTrade(plan, locked, intraday);
@@ -1470,7 +1643,7 @@ async function listedUniverse() {
 async function yahooMinuteChart(symbol) {
   const url =
     `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}` +
-      "?interval=1m&range=15m&includePrePost=true&region=US&lang=en-US";
+      "?interval=1m&range=1h&includePrePost=true&region=US&lang=en-US";
   const data = await fetchJson(url);
   return data.chart?.result?.[0] || null;
 }
@@ -1683,6 +1856,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {
         asOf: new Date(minuteCache.at || Date.now()).toISOString(),
         market: "US",
+        session: tapeSessionNow(),
         basis: "1m",
         universe: listedCache.rows.length || rows.length,
         scanned: rows.length,

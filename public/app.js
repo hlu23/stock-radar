@@ -16,6 +16,8 @@ let savedTimeRange = null;
 let lockedTrade = null;
 let ignoreRangeEvent = false;
 let lastChartSpan = 0;
+let lastAutoFocus = "";
+let lastVolPoints = [];
 let lastIndicatorSnap = "";
 let lastBuySignal = false;
 let buyArmed = false;
@@ -121,7 +123,7 @@ async function loadGainers() {
     gainerShown = PAGE_SIZE;
     renderGainers();
     const q = boardQuery.value.trim();
-    boardStatus.textContent = `${fmtTime(data.asOf)} · 1분봉 ${data.scanned || 0}종 스캔 · ${gainerItems.length}개 중 ${Math.min(gainerShown, gainerItems.length)}개${q ? ` · "${q}"` : ""} · 20초 갱신`;
+    boardStatus.textContent = `${data.session ? `${data.session} · ` : ""}${fmtTime(data.asOf)} · 1분봉 ${data.scanned || 0}종 스캔 · ${gainerItems.length}개 중 ${Math.min(gainerShown, gainerItems.length)}개${q ? ` · "${q}"` : ""} · 20초 갱신`;
   } catch (err) {
     boardStatus.textContent = err.message;
     gainersBody.innerHTML = `<tr><td colspan="10" class="empty">${escapeHtml(err.message)}</td></tr>`;
@@ -231,7 +233,7 @@ function render(data) {
     ? `${company.name} (${company.symbol})`
     : data.query;
   document.getElementById("company-meta").textContent = company
-    ? `${company.exchange} · ${plan.stats?.marketState || "-"} · 후보 ${data.candidates.map((c) => c.symbol).join(", ") || "-"}`
+    ? `${company.exchange} · ${data.quote?.marketState || plan.stats?.marketState || "-"} · 후보 ${data.candidates.map((c) => c.symbol).join(", ") || "-"}`
     : "US 티커를 확정하지 못했습니다.";
 
   renderQuote(data.quote);
@@ -464,6 +466,8 @@ function renderPlan(plan) {
   const ind = plan.indicators || {};
   const lv = plan.levels || {};
   const st = plan.stats || {};
+  const preTape = String(st.marketState || plan.session?.current?.mode || "").toUpperCase().includes("PRE")
+    || plan.session?.current?.mode === "pre";
   const snap = JSON.stringify([ind, lv.price, lv.orh, lv.orl, st.gapPct]);
   const changed = snap !== lastIndicatorSnap;
   lastIndicatorSnap = snap;
@@ -516,23 +520,23 @@ function renderPlan(plan) {
       ind.atr != null && card({ key: "ATR", display: fmtNum(ind.atr) }),
     ], true),
     indGroup("거래량", [
-      ind.lastVolume != null && card({
+      ind.lastVolume > 0 && card({
         key: "1분 거래량",
         display: fmtAmt(ind.lastVolume),
         hint: "2초 갱신",
       }),
-      ind.relVol != null && card({
+      ind.relVol > 0 && card({
         key: "상대거래량",
         display: `${Number(ind.relVol).toFixed(2)}x`,
         tone: Number(ind.relVol) >= 1.5 ? "up" : "",
       }),
-      ind.lastTurnoverLabel && card({ key: "1분 거래대금", display: String(ind.lastTurnoverLabel), hint: "실시간" }),
-      ind.volume != null && card({ key: "당일 거래량", display: fmtAmt(ind.volume), hint: "실시간" }),
-      ind.turnoverLabel && card({ key: "당일 거래대금", display: String(ind.turnoverLabel), span: true }),
+      ind.lastTurnover > 0 && card({ key: "1분 거래대금", display: String(ind.lastTurnoverLabel), hint: "실시간" }),
+      ind.volume > 0 && card({ key: "당일 거래량", display: fmtAmt(ind.volume), hint: "실시간" }),
+      ind.turnover > 0 && card({ key: "당일 거래대금", display: String(ind.turnoverLabel), span: true }),
     ]),
     indGroup("레벨", [
-      lv.orh != null && card({ key: "ORH", display: fmtNum(lv.orh) }),
-      lv.orl != null && card({ key: "ORL", display: fmtNum(lv.orl) }),
+      lv.orh != null && card({ key: preTape ? "PMH" : "ORH", display: fmtNum(lv.orh) }),
+      lv.orl != null && card({ key: preTape ? "PML" : "ORL", display: fmtNum(lv.orl) }),
       st.gapPct != null && card({
         key: "갭",
         display: signedPct(st.gapPct),
@@ -549,7 +553,15 @@ function ensureChart() {
     layout: { background: { color: "#141a2e" }, textColor: "#9aa6c8" },
     grid: { vertLines: { color: "#2a3354" }, horzLines: { color: "#2a3354" } },
     rightPriceScale: { borderColor: "#2a3354" },
-    timeScale: { borderColor: "#2a3354", timeVisible: true, secondsVisible: false },
+    timeScale: {
+      borderColor: "#2a3354",
+      timeVisible: true,
+      secondsVisible: false,
+      tickMarkFormatter: (time) => etClock(time),
+    },
+    localization: {
+      timeFormatter: (time) => etClock(time),
+    },
     autoSize: true,
   });
   new ResizeObserver(() => chart?.applyOptions({})).observe(el);
@@ -566,33 +578,72 @@ function ensureChart() {
     priceFormat: { type: "volume" },
     priceScaleId: "",
   });
-  chart.priceScale("").applyOptions({ scaleMargins: { top: 0.84, bottom: 0 } });
+  chart.priceScale("").applyOptions({ scaleMargins: { top: 0.72, bottom: 0 } });
   chart.timeScale().subscribeVisibleTimeRangeChange((range) => {
     if (ignoreRangeEvent || !range) return;
     savedTimeRange = range;
+    applyVolumeScale(range);
   });
 }
 
-function vwapPath(candles) {
+function applyVolumeScale(range) {
+  if (!volumeSeries) return;
+  const view = range || chart.timeScale().getVisibleRange();
+  let max = 0;
+  for (const point of lastVolPoints) {
+    if (!view || (point.time >= view.from && point.time <= view.to)) {
+      max = Math.max(max, point.value || 0);
+    }
+  }
+  volumeSeries.applyOptions({
+    autoscaleInfoProvider: () => ({
+      priceRange: { minValue: 0, maxValue: max > 0 ? max * 1.2 : 1 },
+    }),
+  });
+}
+
+function etClock(ts) {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).format(new Date(ts * 1000));
+}
+
+function sessionOverlay(candles, period = 9) {
+  const k = 2 / (period + 1);
+  let session = null;
+  let ema = null;
   let pv = 0;
   let vol = 0;
-  return candles.map((c) => {
+  const vwap = [];
+  const emaLine = [];
+  for (const c of candles) {
+    if (c.session !== session) {
+      session = c.session;
+      ema = c.close;
+      pv = 0;
+      vol = 0;
+    }
     const typical = (c.high + c.low + c.close) / 3;
     const v = c.volume || 0;
     pv += typical * v;
     vol += v;
-    return { time: c.time, value: vol ? pv / vol : c.close };
-  });
+    ema = ema == null ? c.close : c.close * k + ema * (1 - k);
+    vwap.push({ time: c.time, value: vol ? pv / vol : c.close });
+    emaLine.push({ time: c.time, value: ema });
+  }
+  return { vwap, ema: emaLine };
 }
 
-function emaPath(candles, period) {
-  if (!candles.length) return [];
-  const k = 2 / (period + 1);
-  let prev = candles[0].close;
-  return candles.map((c) => {
-    prev = c.close * k + prev * (1 - k);
-    return { time: c.time, value: prev };
-  });
+function sessionFocusRange(data) {
+  const last = data.at(-1);
+  if (!last || (last.session !== "pre" && last.session !== "post")) return null;
+  let i = data.length - 1;
+  while (i > 0 && data[i - 1].session === last.session) i -= 1;
+  if (data.length - i < 8) return null;
+  return { from: data[i].time, to: last.time + 60 };
 }
 
 function drawChart(candles, plan, { resetView = false } = {}) {
@@ -608,25 +659,37 @@ function drawChart(candles, plan, { resetView = false } = {}) {
     session: c.session,
   }));
   ignoreRangeEvent = true;
+  const overlay = sessionOverlay(data, 9);
   candleSeries.setData(data.map(({ time, open, high, low, close }) => ({ time, open, high, low, close })));
-  vwapSeries.setData(vwapPath(data));
-  emaSeries.setData(emaPath(data, 9));
-  volumeSeries.setData(data.map((c) => {
+  vwapSeries.setData(overlay.vwap);
+  emaSeries.setData(overlay.ema);
+  lastVolPoints = data.map((c) => {
     const up = c.close >= c.open;
-    let color = up ? "rgba(62,224,162,0.45)" : "rgba(255,107,122,0.45)";
-    if (c.session === "pre") color = "rgba(245,193,92,0.55)";
-    if (c.session === "post") color = "rgba(110,168,255,0.5)";
-    if (c.session === "other" || c.volume === 0) color = "rgba(154,166,200,0.22)";
-    return { time: c.time, value: c.volume, color };
-  }));
+    let color = up ? "rgba(62,224,162,0.55)" : "rgba(255,107,122,0.55)";
+    if (c.session === "pre") color = "rgba(245,193,92,0.75)";
+    if (c.session === "post") color = "rgba(110,168,255,0.7)";
+    if (c.session === "other") color = "rgba(154,166,200,0.22)";
+    return { time: c.time, value: c.volume || 0, color };
+  });
+  volumeSeries.setData(lastVolPoints);
   applyLines(plan?.trade || {}, isBuySignal(plan));
   const span = data.length > 1 ? data.at(-1).time - data[0].time : 0;
-  if (resetView || !keepRange || (lastChartSpan && Math.abs(span - lastChartSpan) > 6 * 3600)) {
+  const last = data.at(-1);
+  const autoKey = last ? `${last.session}-${Math.floor(last.time / 86400)}` : "";
+  if (resetView) lastAutoFocus = "";
+  const focus = sessionFocusRange(data);
+  const shouldFocus = Boolean(focus) && (resetView || lastAutoFocus !== autoKey);
+  if (shouldFocus) {
+    lastAutoFocus = autoKey;
+    chart.timeScale().setVisibleRange(focus);
+    savedTimeRange = chart.timeScale().getVisibleRange();
+  } else if (resetView || !keepRange || (lastChartSpan && Math.abs(span - lastChartSpan) > 6 * 3600)) {
     chart.timeScale().fitContent();
     savedTimeRange = chart.timeScale().getVisibleRange();
   } else {
     chart.timeScale().setVisibleRange(keepRange);
   }
+  applyVolumeScale(savedTimeRange || chart.timeScale().getVisibleRange());
   lastChartSpan = span;
   ignoreRangeEvent = false;
 }
