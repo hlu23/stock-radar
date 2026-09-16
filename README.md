@@ -2,10 +2,14 @@
 
 현재 버전: **V1** (`v1`)
 
+무료 사이트: https://stock-radar-ku87.onrender.com
+
 미장(NASDAQ·NYSE) **당일 급등주** 보드 + 종목별 1분봉·해외 뉴스 단타 초안.
 
+로컬 실행:
+
 ```bash
-node server.js
+npm start
 ```
 
 http://127.0.0.1:8787
