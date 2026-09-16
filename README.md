@@ -1,6 +1,6 @@
 # Stock Radar
 
-현재 버전: **V1.1** (`v1.1`)
+현재 버전: **V2** (`v2`)
 
 무료 사이트: https://stock-radar-ku87.onrender.com
 

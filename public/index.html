@@ -3,14 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Stock Radar — 미장 급등주</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <title>Stock Radar V2 — 미장 급등주</title>
+    <link rel="stylesheet" href="/styles.css?v=2" />
   </head>
   <body>
     <main class="shell">
       <header class="top">
         <div>
-          <p class="eyebrow">Stock Radar · US movers</p>
+          <p class="eyebrow">Stock Radar V2 · US movers</p>
           <h1>미장 급등주 레이더</h1>
         </div>
         <p class="note">미장 <strong>프장 단타</strong>가 주력입니다. 정규장은 눌림만 보조로 봅니다. 급등 보드는 직전 1분봉 기준입니다.</p>
@@ -198,7 +198,10 @@
               </div>
               <p id="chart-live" class="meta">시세 연결 대기</p>
             </div>
-            <div id="chart"></div>
+            <div class="chart-box">
+              <div id="chart"></div>
+              <div id="chart-tip" class="chart-tip" hidden></div>
+            </div>
           </div>
 
           <section class="plan">
@@ -234,6 +237,6 @@
       </section>
     </main>
     <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
-    <script src="/app.js?v=pre5"></script>
+    <script src="/app.js?v=2"></script>
   </body>
 </html>
