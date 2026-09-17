@@ -4,26 +4,33 @@ const statusEl = document.getElementById("status");
 const result = document.getElementById("result");
 
 let chart;
+let volChart;
 let candleSeries;
 let vwapSeries;
 let emaSeries;
 let volumeSeries;
+let syncingRange = false;
 let pollTimer;
 let refreshBusy = false;
 let activeSymbol = "";
 let activeBias = "중립";
+let lastShares = null;
+let lastMarketCap = null;
 let savedTimeRange = null;
+let savedLogicalRange = null;
 let lockedTrade = null;
+let buyAlertAt = 0;
+let buyPendingSince = 0;
+let buyCooldownUntil = 0;
 let ignoreRangeEvent = false;
-let lastChartSpan = 0;
-let lastAutoFocus = "";
+let lastDrawnBarTime = 0;
 let lastVolPoints = [];
 let lastBarsByTime = new Map();
 let lastIndicatorSnap = "";
 let lastBuySignal = false;
 let buyArmed = false;
-let buyAlertSpent = false;
 let buyAlertOpen = false;
+let buyMarkers = [];
 let newsItems = [];
 let newsFilter = "전체";
 
@@ -77,6 +84,7 @@ const moreGainers = document.getElementById("more-gainers");
 let gainerTimer;
 let gainerItems = [];
 let gainerShown = 10;
+let gainerEtDay = "";
 const PAGE_SIZE = 10;
 const MAX_GAINERS = 100;
 
@@ -87,25 +95,27 @@ form.addEventListener("submit", async (event) => {
   await runScan(q);
 });
 
-document.getElementById("refresh-gainers").addEventListener("click", () => loadGainers());
+document.getElementById("refresh-gainers").addEventListener("click", () => loadGainers({ resetPage: true }));
 for (const id of ["minPct", "minVol", "minTurnover", "minPrice", "maxPrice", "minRel", "sortBy"]) {
-  document.getElementById(id).addEventListener("change", () => loadGainers());
+  document.getElementById(id).addEventListener("change", () => loadGainers({ resetPage: true }));
 }
 const boardQuery = document.getElementById("board-q");
 let boardQTimer;
 boardQuery.addEventListener("input", () => {
   clearTimeout(boardQTimer);
-  boardQTimer = setTimeout(() => loadGainers(), 250);
+  boardQTimer = setTimeout(() => loadGainers({ resetPage: true }), 250);
 });
 boardQuery.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
     clearTimeout(boardQTimer);
-    loadGainers();
+    loadGainers({ resetPage: true });
   }
 });
 
-async function loadGainers() {
+async function loadGainers({ resetPage = false } = {}) {
+  if (loadGainers.busy) return;
+  loadGainers.busy = true;
   const params = new URLSearchParams({
     q: boardQuery.value.trim(),
     minPct: document.getElementById("minPct").value,
@@ -117,55 +127,62 @@ async function loadGainers() {
     sort: document.getElementById("sortBy").value,
     limit: String(MAX_GAINERS),
   });
-  boardStatus.textContent = "1분봉 급등주 수집 중…";
+  if (!gainerItems.length) boardStatus.textContent = "야후 급등주 수집 중…";
   try {
     const res = await fetch("/api/gainers?" + params.toString());
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "급등주 조회 실패");
+    const dayCol = document.getElementById("col-day");
+    if (dayCol) dayCol.textContent = data.session === "POST" ? "애프터 등락" : "하루 등락";
+    if (data.etDay && data.etDay !== gainerEtDay) {
+      gainerEtDay = data.etDay;
+      gainerShown = PAGE_SIZE;
+    }
+    const keep = resetPage ? PAGE_SIZE : gainerShown;
     gainerItems = (data.items || []).slice(0, MAX_GAINERS);
-    gainerShown = PAGE_SIZE;
+    gainerShown = Math.min(Math.max(keep, PAGE_SIZE), Math.max(gainerItems.length, PAGE_SIZE), MAX_GAINERS);
     renderGainers();
     const q = boardQuery.value.trim();
-    boardStatus.textContent = `${data.session ? `${data.session} · ` : ""}${fmtTime(data.asOf)} · 1분봉 ${data.scanned || 0}종 스캔 · ${gainerItems.length}개 중 ${Math.min(gainerShown, gainerItems.length)}개${q ? ` · "${q}"` : ""} · 20초 갱신`;
+    boardStatus.textContent = `${data.session ? `${data.session} · ` : ""}${fmtTime(data.asOf)} · 야후 1분봉 ${data.scanned || 0}종 · ${gainerItems.length}개 중 ${Math.min(gainerShown, gainerItems.length)}개${q ? ` · "${q}"` : ""} · 실시간`;
   } catch (err) {
-    boardStatus.textContent = err.message;
-    gainersBody.innerHTML = `<tr><td colspan="10" class="empty">${escapeHtml(err.message)}</td></tr>`;
-    moreGainers.hidden = true;
+    if (!gainerItems.length) {
+      boardStatus.textContent = err.message;
+      gainersBody.innerHTML = `<tr><td colspan="11" class="empty">${escapeHtml(err.message)}</td></tr>`;
+      moreGainers.hidden = true;
+    }
+  } finally {
+    loadGainers.busy = false;
   }
 }
 
 function renderGainers() {
   const items = gainerItems.slice(0, gainerShown);
   if (!gainerItems.length) {
-    gainersBody.innerHTML = `<tr><td colspan="10" class="empty">조건에 맞는 종목이 없습니다. 검색어나 필터를 바꿔 보세요.</td></tr>`;
+    gainersBody.innerHTML = `<tr><td colspan="11" class="empty">조건에 맞는 종목이 없습니다. 검색어나 필터를 바꿔 보세요.</td></tr>`;
     moreGainers.hidden = true;
     return;
   }
   gainersBody.innerHTML = items
     .map((row, i) => {
-      const pct = row.changePct;
-      const tone = pct == null ? "" : pct >= 0 ? "up" : "down";
-      const pctTxt = pct == null ? "-" : `${pct >= 0 ? "+" : ""}${Number(pct).toFixed(2)}%`;
+      const dayPct = row.dayChangePct ?? row.changePct;
+      const minPct = row.minuteChangePct;
       const surge = row.volSurgePct;
-      const surgeTone = surge == null ? "" : surge >= 0 ? "up" : "down";
-      const surgeTxt = surge == null ? "-" : `${surge >= 0 ? "+" : ""}${Number(surge).toFixed(0)}%`;
       const delta = row.volDelta;
-      const deltaTone = delta == null ? "" : delta >= 0 ? "up" : "down";
-      const deltaTxt = delta == null
-        ? "-"
-        : `${delta >= 0 ? "+" : "-"}${fmtAmt(Math.abs(delta))}`;
+      const deltaTone = delta > 0 ? "up" : "";
+      const deltaTxt = delta == null ? "-" : fmtAmt(delta);
       return `
       <tr data-symbol="${escapeHtml(row.symbol)}">
         <td>${i + 1}</td>
         <td class="ticker">${escapeHtml(row.symbol)}</td>
         <td class="name-cell">${escapeHtml(row.name)}</td>
         <td class="num">${row.price != null ? fmtNum(row.price) : "-"}</td>
-        <td class="num ${tone}">${pctTxt}</td>
+        <td class="num ${pctTone(dayPct)}">${fmtPctSigned(dayPct, 2)}</td>
+        <td class="num ${pctTone(minPct)}">${fmtPctSigned(minPct, 2)}</td>
         <td class="num">${fmtAmt(row.volume)}</td>
-        <td class="num ${surgeTone}">${surgeTxt}</td>
+        <td class="num ${pctTone(surge)}">${fmtPctSigned(surge)}</td>
         <td class="num ${deltaTone}">${deltaTxt}</td>
         <td class="num">${fmtAmt(row.turnover)}</td>
-        <td class="num"><span class="heat">${row.heat != null ? row.heat : "-"}</span></td>
+        <td class="num"><span class="heat ${row.heat != null && row.heat < 0 ? "down" : ""}">${row.heat != null ? row.heat : "-"}</span></td>
       </tr>
     `;
     })
@@ -189,6 +206,25 @@ gainersBody.addEventListener("click", (event) => {
   document.getElementById("search-form").scrollIntoView({ behavior: "smooth" });
 });
 
+function pctTone(n) {
+  if (n == null || Number.isNaN(Number(n))) return "";
+  return Number(n) >= 0 ? "up" : "down";
+}
+
+function fmtPctSigned(n, digits) {
+  if (n == null || Number.isNaN(Number(n))) return "-";
+  const v = Number(n);
+  const abs = Math.abs(v);
+  const d = digits != null
+    ? digits
+    : abs >= 100 ? 0 : abs >= 10 ? 1 : 2;
+  const txt = abs.toLocaleString("en-US", {
+    maximumFractionDigits: d,
+    minimumFractionDigits: 0,
+  });
+  return `${v >= 0 ? "+" : "-"}${txt}%`;
+}
+
 function fmtAmt(n) {
   if (n == null || Number.isNaN(n)) return "-";
   if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
@@ -197,8 +233,8 @@ function fmtAmt(n) {
   return String(Math.round(n));
 }
 
-loadGainers();
-gainerTimer = setInterval(loadGainers, 20000);
+loadGainers({ resetPage: true });
+gainerTimer = setInterval(() => loadGainers(), 1000);
 
 async function runScan(q) {
   statusEl.textContent = `"${q}" 해외 뉴스·1분봉 수집 중…`;
@@ -212,25 +248,27 @@ async function runScan(q) {
     const resetView = nextSymbol !== activeSymbol;
     activeBias = data.condition || "중립";
     if (resetView) {
+      lastShares = null;
+      lastMarketCap = null;
       lastBuySignal = false;
       buyArmed = false;
-      buyAlertSpent = false;
       buyAlertOpen = false;
+      buyMarkers = [];
+      lastBarsByTime = new Map();
+      applyBuyMarkers();
       hideBuyAlert();
-      lockedTrade = {
-        sellAnchor: data.plan?.trade?.sellAnchor ?? data.plan?.trade?.sellPrice,
-      };
-    } else {
-      lockedTrade = {
-        ...lockedTrade,
-        sellAnchor: lockedTrade?.sellAnchor ?? data.plan?.trade?.sellAnchor ?? data.plan?.trade?.sellPrice,
-      };
+      lockedTrade = null;
+      buyAlertAt = 0;
+      buyPendingSince = 0;
+      buyCooldownUntil = 0;
+    } else if (!buyArmed) {
+      lockedTrade = null;
     }
     render(data);
-    handleBuySignal(data.plan, data.quote?.price ?? data.plan?.levels?.price);
     drawChart(data.candles || [], data.plan, { resetView });
+    handleBuySignal(data.plan, data.quote?.price ?? data.plan?.levels?.price);
     activeSymbol = nextSymbol;
-    statusEl.textContent = `${fmtTime(data.asOf)} · 1분봉 2초 갱신`;
+    statusEl.textContent = `${fmtTime(data.asOf)} · 1분봉 1초 갱신`;
     result.hidden = false;
     if (activeSymbol) startPoll();
   } catch (err) {
@@ -286,9 +324,20 @@ function render(data) {
   if (data.disclaimer) document.getElementById("disclaimer").textContent = data.disclaimer;
 }
 
+function fmtCap(n) {
+  if (n == null || Number.isNaN(Number(n))) return "-";
+  return `$${fmtAmt(Number(n))}`;
+}
+
 function renderQuote(quote) {
   const priceEl = document.getElementById("price");
   const changeEl = document.getElementById("change");
+  const sharesEl = document.getElementById("shares-out");
+  const capEl = document.getElementById("market-cap");
+  if (quote?.shares != null) lastShares = quote.shares;
+  if (quote?.marketCap != null) lastMarketCap = quote.marketCap;
+  if (sharesEl) sharesEl.textContent = fmtAmt(quote?.shares ?? lastShares);
+  if (capEl) capEl.textContent = fmtCap(quote?.marketCap ?? lastMarketCap);
   if (quote?.price != null) {
     priceEl.textContent = `${fmtNum(quote.price)} ${quote.currency || ""}`.trim();
     const sign = quote.change >= 0 ? "+" : "";
@@ -310,36 +359,41 @@ function isBuySignal(plan) {
 
 function buyAlertText(trade) {
   const liveBuy = trade.buyLivePrice ?? trade.buyPrice;
-  return `${trade.buyLiveExecutable ? "지금 ASK에 매수" : "호가 대기"} ${fmtNum(liveBuy)} · 고정 ${fmtNum(trade.buyPrice)} · 손절 ${fmtNum(trade.stopPrice)} · ${new Date().toLocaleTimeString("ko-KR", { hour12: false })}`;
+  return `${trade.buyLiveExecutable ? "지금 ASK에 매수" : "호가 대기"} ${fmtNum(liveBuy)} · ${new Date().toLocaleTimeString("ko-KR", { hour12: false })}`;
+}
+
+function alertPx(v) {
+  return v != null && Number.isFinite(Number(v)) ? fmtNum(v) : "-";
+}
+
+function fillAlertLevels(trade) {
+  const buy = trade.buyLivePrice ?? trade.buyPrice;
+  const sell = trade.takeProfit ?? trade.sellPrice;
+  const stop = trade.stopLivePrice ?? trade.stopPrice;
+  const buyEl = document.getElementById("alert-buy-price");
+  const sellEl = document.getElementById("alert-sell-price");
+  const stopEl = document.getElementById("alert-stop-price");
+  if (buyEl) buyEl.textContent = alertPx(buy);
+  if (sellEl) sellEl.textContent = alertPx(sell);
+  if (stopEl) stopEl.textContent = alertPx(stop);
 }
 
 function showBuyAlert(trade, { pulse = false } = {}) {
   const box = document.getElementById("buy-alert");
   const detail = document.getElementById("buy-alert-detail");
   detail.textContent = buyAlertText(trade);
+  fillAlertLevels(trade);
   box.hidden = false;
   if (pulse) {
     box.style.animation = "none";
     void box.offsetWidth;
     box.style.animation = "";
   }
-  setLiveTickets(true);
-  document.querySelector(".ticket.buy-live")?.classList.add("hot");
 }
 
 function hideBuyAlert() {
   const box = document.getElementById("buy-alert");
   if (box) box.hidden = true;
-  setLiveTickets(false);
-  document.querySelector(".ticket.buy-live")?.classList.remove("hot");
-}
-
-function setLiveTickets(on) {
-  document.getElementById("tickets")?.classList.toggle("live-on", on);
-  const buyLive = document.querySelector(".ticket.buy-live");
-  const stopLive = document.querySelector(".ticket.stop-live");
-  if (buyLive) buyLive.hidden = !on;
-  if (stopLive) stopLive.hidden = !on;
 }
 
 function planPrice(plan, fallback) {
@@ -348,16 +402,66 @@ function planPrice(plan, fallback) {
 }
 
 function buyAlertShouldClose(px, entry) {
+  if (buyAlertAt && Date.now() - buyAlertAt >= 60 * 1000) return "time";
   if (px == null || entry == null || !(entry > 0)) return false;
   if (px <= entry * 0.9) return "down";
-  if (px > entry) return "up";
+  const stop = Number(lockedTrade?.stopPrice);
+  if (Number.isFinite(stop) && px <= stop) return "down";
+  const t5 = Number(lockedTrade?.sellAnchor);
+  if (Number.isFinite(t5) && px >= t5) return "up";
+  const t10 = Number(lockedTrade?.sellStretch);
+  if (Number.isFinite(t10) && px >= t10) return "up";
   return false;
+}
+
+function closeBuyAlert(signalStillOn) {
+  hideBuyAlert();
+  buyAlertOpen = false;
+  buyArmed = false;
+  buyAlertAt = 0;
+  buyPendingSince = 0;
+  lastBuySignal = Boolean(signalStillOn);
+  buyCooldownUntil = Date.now() + 1500;
+}
+
+function latestCandleTime() {
+  let latest = null;
+  for (const t of lastBarsByTime.keys()) {
+    if (latest == null || t > latest) latest = t;
+  }
+  return latest ?? Math.floor(Date.now() / 1000 / 60) * 60;
+}
+
+function applyBuyMarkers() {
+  if (candleSeries) {
+    candleSeries.setMarkers(
+      [...buyMarkers].sort((a, b) => a.time - b.time),
+    );
+  }
+  const btn = document.getElementById("reset-buy-marks");
+  if (btn) btn.disabled = buyMarkers.length === 0;
+}
+
+function addBuyMarker(time) {
+  const t = Number(time);
+  if (!Number.isFinite(t)) return;
+  if (buyMarkers.some((m) => m.time === t)) return;
+  buyMarkers.push({
+    time: t,
+    position: "belowBar",
+    color: "#3ee0a2",
+    shape: "arrowUp",
+    text: "매수",
+    size: 1,
+  });
+  applyBuyMarkers();
 }
 
 function handleBuySignal(plan, livePrice) {
   const trade = plan?.trade || {};
   const px = planPrice(plan, livePrice);
   const entry = Number(lockedTrade?.alertPrice ?? lockedTrade?.buyPrice);
+  const on = isBuySignal(plan);
   const shown = {
     ...trade,
     buyPrice: lockedTrade?.buyPrice ?? trade.buyPrice,
@@ -367,58 +471,50 @@ function handleBuySignal(plan, livePrice) {
   };
 
   if (buyAlertOpen) {
-    if (buyAlertShouldClose(px, entry)) {
-      hideBuyAlert();
-      buyAlertOpen = false;
-      buyArmed = false;
-      lastBuySignal = true;
+    if (!on || buyAlertShouldClose(px, entry)) {
+      closeBuyAlert(on);
       return;
     }
-    showBuyAlert(shown, { pulse: false });
+    fillAlertLevels(shown);
+    lastBuySignal = true;
     return;
   }
 
-  if (buyAlertSpent || !isBuySignal(plan)) return;
+  if (!on) {
+    lastBuySignal = false;
+    buyPendingSince = 0;
+    return;
+  }
+  if (Date.now() < buyCooldownUntil) return;
+  if (lastBuySignal) return;
+  if (!buyPendingSince) buyPendingSince = Date.now();
+  if (Date.now() - buyPendingSince < 4000) return;
 
   const alertPrice = trade.buyLivePrice ?? trade.buyPrice;
   lockedTrade = {
     ...lockedTrade,
     alertPrice,
+    alertAt: Date.now(),
     buyPrice: alertPrice,
-    buyReason: `매수 타이밍 고정 ${fmtNum(alertPrice)}`,
+    buyReason: `매수 타이밍 고정 ${fmtNum(alertPrice)} · 5~10분`,
     sellAnchor: trade.sellAnchor ?? trade.sellPrice,
+    sellStretch: trade.sellStretch,
     stopPrice: trade.stopPrice,
     stopReason: trade.stopReason || `매수 타이밍 손절 ${fmtNum(trade.stopPrice)}`,
   };
+  buyAlertAt = lockedTrade.alertAt;
   shown.buyPrice = lockedTrade.buyPrice;
   shown.stopPrice = lockedTrade.stopPrice;
-  buyAlertSpent = true;
   buyAlertOpen = true;
   buyArmed = true;
   lastBuySignal = true;
   showBuyAlert(shown, { pulse: true });
-  renderTrade({ trade: shown });
+  addBuyMarker(latestCandleTime());
 }
 
-function renderTrade(plan, { onlyTakeProfit = false } = {}) {
-  const trade = plan.trade || {};
-  const sell = trade.takeProfit ?? trade.sellPrice;
-  const liveBuy = trade.buyLivePrice ?? trade.buyPrice;
-  document.getElementById("buy-live-price").textContent = liveBuy != null ? fmtNum(liveBuy) : "없음";
-  document.getElementById("buy-live-reason").textContent = trade.buyLiveReason
-    || (trade.ask != null ? `ASK ${fmtNum(trade.ask)}` : "호가 대기");
-  document.querySelector(".ticket.buy-live")?.classList.toggle("ready", Boolean(trade.buyLiveExecutable));
-  document.querySelector(".ticket.buy-live")?.classList.toggle("blocked", trade.buyLiveExecutable === false);
-  document.getElementById("sell-price").textContent = sell != null ? fmtNum(sell) : "없음";
-  document.getElementById("sell-reason").textContent = trade.sellReason || trade.takeProfitReason || "";
-  document.getElementById("stop-live-price").textContent = trade.stopLivePrice != null ? fmtNum(trade.stopLivePrice) : "없음";
-  document.getElementById("stop-live-reason").textContent = trade.stopLiveReason || "";
-  if (!onlyTakeProfit) {
-    document.getElementById("buy-price").textContent = trade.buyPrice != null ? fmtNum(trade.buyPrice) : "없음";
-    document.getElementById("buy-reason").textContent = trade.buyReason || "";
-    document.getElementById("stop-price").textContent = trade.stopPrice != null ? fmtNum(trade.stopPrice) : "없음";
-    document.getElementById("stop-reason").textContent = trade.stopReason || "";
-  }
+function renderTrade(plan) {
+  if (!buyAlertOpen) return;
+  fillAlertLevels(plan.trade || {});
 }
 
 function renderSession(session) {
@@ -482,8 +578,8 @@ const IND_TIPS = {
   "EMA21": "최근 21분 지수이동평균입니다. 중기 추세선이고, EMA9이 EMA21 위에 있으면 단기 상승 우세로 봅니다.",
   "VWAP": "거래량으로 가중한 평균가입니다. 세션(프장/본장/애프터)마다 리셋되며, 이 선 위면 매수 우위, 아래면 매도 우위로 봅니다.",
   "VWAP 이격": "현재가가 VWAP에서 얼마나 떨어져 있는지의 비율입니다. 플러스는 VWAP 위, 마이너스는 VWAP 아래입니다.",
-  "ATR": "최근 변동 폭(평균 진폭)입니다. 손절·익절 거리를 잡을 때 참고합니다. 값이 클수록 흔들림이 큽니다.",
-  "1분 거래량": "지금 만들고 있는 1분봉에서 체결된 주식 수입니다. 프장에는 토스 1분 거래량을 씁니다.",
+  "ATR": "최근 1분봉 평균 진폭입니다. 5분·10분 익절과 손절 거리를 이 값으로 잡습니다.",
+  "1분 거래량": "지금 만들고 있는 1분봉에서 체결된 주식 수입니다. 야후 1분 거래량이며 분이 바뀌면 다시 쌓입니다.",
   "상대거래량": "최근 1분 평균 거래량 대비 배수입니다. 1.5배 이상이면 갑자기 돈이 들어온 구간으로 봅니다.",
   "1분 거래대금": "1분 거래량 × 현재가입니다. 주수보다 실제 돈의 크기를 볼 때 씁니다.",
   "당일 거래량": "오늘 세션에서 누적된 거래량입니다.",
@@ -602,7 +698,7 @@ function renderPlan(plan) {
       ind.lastVolume > 0 && card({
         key: "1분 거래량",
         display: fmtAmt(ind.lastVolume),
-        hint: "2초 갱신",
+        hint: "1초 갱신",
       }),
       ind.relVol > 0 && card({
         key: "상대거래량",
@@ -626,25 +722,108 @@ function renderPlan(plan) {
   restoreIndTip();
 }
 
+function chartTheme() {
+  return {
+    layout: { background: { color: "#141a2e" }, textColor: "#9aa6c8" },
+    grid: { vertLines: { color: "#2a3354" }, horzLines: { color: "#2a3354" } },
+    rightPriceScale: {
+      borderColor: "#2a3354",
+      minimumWidth: 76,
+      entireTextOnly: true,
+    },
+    localization: { timeFormatter: (time) => etClock(time) },
+    autoSize: true,
+    handleScroll: {
+      mouseWheel: false,
+      pressedMouseMove: true,
+      horzTouchDrag: true,
+      vertTouchDrag: true,
+    },
+    handleScale: {
+      mouseWheel: true,
+      pinch: true,
+      axisPressedMouseMove: true,
+      axisDoubleClickReset: true,
+    },
+  };
+}
+
+function volPriceLabel(price) {
+  const n = Number(price);
+  if (!Number.isFinite(n) || n <= 0) return "0";
+  if (n >= 1e6) return `${(n / 1e6).toFixed(n >= 10e6 ? 0 : 1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(n >= 10e3 ? 0 : 1)}K`;
+  return String(Math.round(n));
+}
+
+function alignChartPanes() {
+  if (!chart || !volChart) return;
+  const range = chart.timeScale().getVisibleLogicalRange();
+  if (!range) return;
+  const prevIgnore = ignoreRangeEvent;
+  ignoreRangeEvent = true;
+  try {
+    volChart.timeScale().setVisibleLogicalRange(range);
+    const opt = chart.timeScale().options();
+    if (opt?.barSpacing != null) {
+      volChart.timeScale().applyOptions({
+        barSpacing: opt.barSpacing,
+        rightOffset: opt.rightOffset,
+      });
+    }
+  } catch {}
+  ignoreRangeEvent = prevIgnore;
+  applyVolumeScale(chart.timeScale().getVisibleRange());
+}
+
 function ensureChart() {
   if (chart) return;
   const el = document.getElementById("chart");
+  const volEl = document.getElementById("chart-vol");
+  const sharedTime = {
+    borderColor: "#2a3354",
+    rightOffset: 4,
+    lockVisibleTimeRangeOnResize: true,
+  };
   chart = LightweightCharts.createChart(el, {
-    layout: { background: { color: "#141a2e" }, textColor: "#9aa6c8" },
-    grid: { vertLines: { color: "#2a3354" }, horzLines: { color: "#2a3354" } },
-    rightPriceScale: { borderColor: "#2a3354" },
+    ...chartTheme(),
     timeScale: {
-      borderColor: "#2a3354",
+      ...sharedTime,
+      visible: false,
+      timeVisible: false,
+      secondsVisible: false,
+    },
+  });
+  volChart = LightweightCharts.createChart(volEl, {
+    ...chartTheme(),
+    localization: {
+      timeFormatter: (time) => etClock(time),
+      priceFormatter: volPriceLabel,
+    },
+    handleScroll: {
+      mouseWheel: false,
+      pressedMouseMove: true,
+      horzTouchDrag: true,
+      vertTouchDrag: false,
+    },
+    handleScale: {
+      mouseWheel: true,
+      pinch: true,
+      axisPressedMouseMove: { time: true, price: false },
+      axisDoubleClickReset: true,
+    },
+    timeScale: {
+      ...sharedTime,
       timeVisible: true,
       secondsVisible: false,
       tickMarkFormatter: (time) => etClock(time),
     },
-    localization: {
-      timeFormatter: (time) => etClock(time),
-    },
-    autoSize: true,
   });
-  new ResizeObserver(() => chart?.applyOptions({})).observe(el);
+  new ResizeObserver(() => {
+    chart?.applyOptions({});
+    volChart?.applyOptions({});
+    requestAnimationFrame(alignChartPanes);
+  }).observe(el.parentElement || el);
   candleSeries = chart.addCandlestickSeries({
     upColor: "#3ee0a2",
     downColor: "#ff6b7a",
@@ -652,18 +831,56 @@ function ensureChart() {
     wickUpColor: "#3ee0a2",
     wickDownColor: "#ff6b7a",
   });
+  candleSeries.priceScale().applyOptions({ scaleMargins: { top: 0.06, bottom: 0.08 } });
   vwapSeries = chart.addLineSeries({ color: "#6ea8ff", lineWidth: 2, priceLineVisible: false });
   emaSeries = chart.addLineSeries({ color: "#f5c15c", lineWidth: 1, priceLineVisible: false });
-  volumeSeries = chart.addHistogramSeries({
+  volumeSeries = volChart.addHistogramSeries({
     priceFormat: { type: "volume" },
-    priceScaleId: "",
+    lastValueVisible: false,
+    priceLineVisible: false,
+    baseLineVisible: false,
   });
-  chart.priceScale("").applyOptions({ scaleMargins: { top: 0.72, bottom: 0 } });
-  chart.timeScale().subscribeVisibleTimeRangeChange((range) => {
-    if (ignoreRangeEvent || !range) return;
-    savedTimeRange = range;
-    applyVolumeScale(range);
+  volumeSeries.priceScale().applyOptions({
+    scaleMargins: { top: 0.12, bottom: 0.02 },
+    borderVisible: false,
   });
+  const syncFrom = (source, target) => (range) => {
+    if (ignoreRangeEvent || syncingRange || !range) return;
+    syncingRange = true;
+    try {
+      target.timeScale().setVisibleLogicalRange(range);
+      if (source === chart) {
+        const opt = chart.timeScale().options();
+        if (opt?.barSpacing != null) {
+          volChart.timeScale().applyOptions({
+            barSpacing: opt.barSpacing,
+            rightOffset: opt.rightOffset,
+          });
+        }
+        savedLogicalRange = range;
+        savedTimeRange = chart.timeScale().getVisibleRange();
+        applyVolumeScale(savedTimeRange);
+      }
+    } catch {}
+    syncingRange = false;
+  };
+  chart.timeScale().subscribeVisibleLogicalRangeChange(syncFrom(chart, volChart));
+  volChart.timeScale().subscribeVisibleLogicalRangeChange(syncFrom(volChart, chart));
+  let syncingCrosshair = false;
+  const followCrosshair = (to, series) => (param) => {
+    if (syncingCrosshair) return;
+    if (!param?.time || param.point == null) {
+      try { to.clearCrosshairPosition(); } catch {}
+      return;
+    }
+    const bar = lastBarsByTime.get(Number(param.time)) || lastBarsByTime.get(param.time);
+    const px = series === volumeSeries ? (bar?.volume || 0) : (bar?.close || 0);
+    syncingCrosshair = true;
+    try { to.setCrosshairPosition(px, param.time, series); } catch {}
+    syncingCrosshair = false;
+  };
+  chart.subscribeCrosshairMove(followCrosshair(volChart, volumeSeries));
+  volChart.subscribeCrosshairMove(followCrosshair(chart, candleSeries));
   bindChartTip();
 }
 
@@ -683,10 +900,10 @@ function estimateBuySell(bar) {
 
 function bindChartTip() {
   const tip = document.getElementById("chart-tip");
-  const host = document.getElementById("chart");
+  const host = document.getElementById("chart")?.parentElement;
   if (!chart || !tip || !host || tip.dataset.bound) return;
   tip.dataset.bound = "1";
-  chart.subscribeCrosshairMove((param) => {
+  const showTip = (param, origin) => {
     if (!param?.point || param.time == null) {
       tip.hidden = true;
       return;
@@ -722,21 +939,24 @@ function bindChartTip() {
     const pad = 10;
     const tw = tip.offsetWidth;
     const th = tip.offsetHeight;
+    const originTop = origin === volChart ? (document.getElementById("chart")?.clientHeight || 0) : 0;
     let left = param.point.x + 14;
-    let top = param.point.y + 14;
+    let top = originTop + param.point.y + 14;
     if (left + tw > host.clientWidth - pad) left = param.point.x - tw - 14;
-    if (top + th > host.clientHeight - pad) top = param.point.y - th - 14;
+    if (top + th > host.clientHeight - pad) top = originTop + param.point.y - th - 14;
     if (left < pad) left = pad;
     if (top < pad) top = pad;
     tip.style.left = `${Math.round(left)}px`;
     tip.style.top = `${Math.round(top)}px`;
-  });
+  };
+  chart.subscribeCrosshairMove((param) => showTip(param, chart));
+  volChart.subscribeCrosshairMove((param) => showTip(param, volChart));
 }
 
 function applyVolumeScale(range) {
   if (!volumeSeries) return;
   const view = range || chart.timeScale().getVisibleRange();
-  let max = 0;
+  let max = lastVolPoints.at(-1)?.value || 0;
   for (const point of lastVolPoints) {
     if (!view || (point.time >= view.from && point.time <= view.to)) {
       max = Math.max(max, point.value || 0);
@@ -793,9 +1013,22 @@ function sessionFocusRange(data) {
   return { from: data[i].time, to: last.time + 60 };
 }
 
+function followLiveLogicalRange(keepLogical, data, prevLastTime) {
+  const from = Number(keepLogical?.from);
+  const to = Number(keepLogical?.to);
+  if (!Number.isFinite(from) || !Number.isFinite(to) || !data.length) return keepLogical;
+  const newBarCount = prevLastTime
+    ? data.filter((c) => c.time > prevLastTime).length
+    : 0;
+  if (!(newBarCount > 0)) return keepLogical;
+  const prevLastIndex = data.length - 1 - newBarCount;
+  if (to < prevLastIndex - 1.5) return keepLogical;
+  return { from: from + newBarCount, to: to + newBarCount };
+}
+
 function drawChart(candles, plan, { resetView = false } = {}) {
   ensureChart();
-  const keepRange = !resetView && (savedTimeRange || chart.timeScale().getVisibleRange());
+  const keepLogical = !resetView && (savedLogicalRange || chart.timeScale().getVisibleLogicalRange());
   const data = candles.map((c) => ({
     time: c.time,
     open: c.open,
@@ -812,71 +1045,49 @@ function drawChart(candles, plan, { resetView = false } = {}) {
   emaSeries.setData(overlay.ema);
   lastVolPoints = data.map((c) => {
     const up = c.close >= c.open;
-    let color = up ? "rgba(62,224,162,0.55)" : "rgba(255,107,122,0.55)";
-    if (c.session === "pre") color = "rgba(245,193,92,0.75)";
-    if (c.session === "post") color = "rgba(110,168,255,0.7)";
-    if (c.session === "other") color = "rgba(154,166,200,0.22)";
-    return { time: c.time, value: c.volume || 0, color };
+    let color = up ? "rgba(62,224,162,0.85)" : "rgba(255,107,122,0.85)";
+    if (c.session === "pre") color = "rgba(245,193,92,0.9)";
+    if (c.session === "post") color = "rgba(110,168,255,0.88)";
+    if (c.session === "other") color = "rgba(154,166,200,0.4)";
+    return { time: c.time, value: c.volume > 0 ? c.volume : 0, color };
   });
   lastBarsByTime = new Map(data.map((c) => [c.time, c]));
   volumeSeries.setData(lastVolPoints);
-  applyLines(plan?.trade || {}, isBuySignal(plan));
-  const span = data.length > 1 ? data.at(-1).time - data[0].time : 0;
+  applyLines();
+  applyBuyMarkers();
   const last = data.at(-1);
-  const autoKey = last ? `${last.session}-${Math.floor(last.time / 86400)}` : "";
-  if (resetView) lastAutoFocus = "";
-  const focus = sessionFocusRange(data);
-  const shouldFocus = Boolean(focus) && (resetView || lastAutoFocus !== autoKey);
-  if (shouldFocus) {
-    lastAutoFocus = autoKey;
-    chart.timeScale().setVisibleRange(focus);
-    savedTimeRange = chart.timeScale().getVisibleRange();
-  } else if (resetView || !keepRange || (lastChartSpan && Math.abs(span - lastChartSpan) > 6 * 3600)) {
-    chart.timeScale().fitContent();
-    savedTimeRange = chart.timeScale().getVisibleRange();
+  if (resetView) lastDrawnBarTime = 0;
+  if (resetView || !keepLogical) {
+    const focus = sessionFocusRange(data);
+    if (focus) chart.timeScale().setVisibleRange(focus);
+    else chart.timeScale().fitContent();
   } else {
-    chart.timeScale().setVisibleRange(keepRange);
+    const next = followLiveLogicalRange(keepLogical, data, lastDrawnBarTime);
+    chart.timeScale().setVisibleLogicalRange(next);
   }
-  applyVolumeScale(savedTimeRange || chart.timeScale().getVisibleRange());
-  lastChartSpan = span;
+  alignChartPanes();
+  savedLogicalRange = chart.timeScale().getVisibleLogicalRange();
+  savedTimeRange = chart.timeScale().getVisibleRange();
+  lastDrawnBarTime = last?.time || lastDrawnBarTime;
   ignoreRangeEvent = false;
+  requestAnimationFrame(alignChartPanes);
 }
 
-function applyLines(trade, live = false) {
-  if (!candleSeries._radarMap) candleSeries._radarMap = {};
-  const specs = [
-    { key: "buyLive", price: live ? (trade.buyLivePrice ?? trade.ask ?? trade.buyPrice) : null, color: "#7dffc4", title: "매수 ASK" },
-    { key: "buy", price: trade.buyPrice, color: "#3ee0a2", title: "매수" },
-    { key: "sell", price: trade.takeProfit ?? trade.sellPrice, color: "#6ea8ff", title: "매도/익절" },
-    { key: "stopLive", price: live ? trade.stopLivePrice : null, color: "#f5a15c", title: "손절(실시간)" },
-    { key: "stop", price: trade.stopPrice, color: "#ff6b7a", title: "손절" },
-  ];
-  for (const spec of specs) {
-    const existing = candleSeries._radarMap[spec.key];
-    if (spec.price == null) {
-      if (existing) {
-        try { candleSeries.removePriceLine(existing); } catch {}
-        delete candleSeries._radarMap[spec.key];
-      }
-      continue;
-    }
-    if (existing) {
-      existing.applyOptions({ price: spec.price });
-    } else {
-      candleSeries._radarMap[spec.key] = candleSeries.createPriceLine({
-        price: spec.price,
-        color: spec.color,
-        lineWidth: 2,
-        title: spec.title,
-      });
-    }
+function applyLines() {
+  if (!candleSeries?._radarMap) {
+    if (candleSeries) candleSeries._radarMap = {};
+    return;
+  }
+  for (const key of Object.keys(candleSeries._radarMap)) {
+    try { candleSeries.removePriceLine(candleSeries._radarMap[key]); } catch {}
+    delete candleSeries._radarMap[key];
   }
 }
 
 function startPoll() {
   stopPoll();
   refreshChart();
-  pollTimer = setInterval(refreshChart, 2000);
+  pollTimer = setInterval(refreshChart, 1000);
 }
 
 function stopPoll() {
@@ -893,7 +1104,9 @@ async function refreshChart() {
       bias: activeBias,
     });
     const recast = !buyArmed || !lastBuySignal;
-    if (lockedTrade?.sellAnchor != null) params.set("sell", String(lockedTrade.sellAnchor));
+    if (buyArmed && lockedTrade?.sellAnchor != null) params.set("sell", String(lockedTrade.sellAnchor));
+    if (buyArmed && lockedTrade?.sellStretch != null) params.set("sell10", String(lockedTrade.sellStretch));
+    if (buyArmed && lockedTrade?.alertAt) params.set("since", String(lockedTrade.alertAt));
     if (!recast && lockedTrade?.buyPrice != null) {
       params.set("buy", String(lockedTrade.buyPrice));
       params.set("stop", String(lockedTrade.stopPrice ?? ""));
@@ -904,14 +1117,14 @@ async function refreshChart() {
     if (data.quote) renderQuote(data.quote);
     else if (data.price != null) document.getElementById("price").textContent = fmtNum(data.price);
     if (data.plan) {
+      if (data.candles?.length) drawChart(data.candles, data.plan, { resetView: false });
       handleBuySignal(data.plan, data.price ?? data.quote?.price);
-      renderTrade(data.plan, { onlyTakeProfit: true });
+      renderTrade(data.plan);
       renderSession(data.plan.session);
       renderPlan(data.plan);
-      if (data.candles?.length) drawChart(data.candles, data.plan, { resetView: false });
     }
     document.getElementById("chart-live").textContent =
-      `${data.marketState || data.plan?.stats?.marketState || ""} · 실시간 현재가 ${fmtNum(data.price ?? data.quote?.price ?? "")} · ${new Date().toLocaleTimeString("ko-KR", { hour12: false })}`;
+      `${data.marketState || data.plan?.stats?.marketState || ""} · 야후 1분봉 · 실시간 현재가 ${fmtNum(data.price ?? data.quote?.price ?? "")} · ${new Date().toLocaleTimeString("ko-KR", { hour12: false })}`;
   } catch (err) {
     document.getElementById("chart-live").textContent = err.message;
   } finally {
@@ -926,7 +1139,9 @@ function tone(condition) {
 }
 
 function fmtNum(n) {
-  return Number(n).toLocaleString("ko-KR", { maximumFractionDigits: 4 });
+  const x = Number(n);
+  const digits = !Number.isFinite(x) ? 2 : x >= 1 ? 4 : 6;
+  return x.toLocaleString("ko-KR", { maximumFractionDigits: digits });
 }
 
 function fmtTime(iso) {
@@ -968,6 +1183,10 @@ function bindIndTips() {
 }
 
 bindIndTips();
+document.getElementById("reset-buy-marks")?.addEventListener("click", () => {
+  buyMarkers = [];
+  applyBuyMarkers();
+});
 window.addEventListener("resize", () => chart?.applyOptions({}));
 
 const preset = new URLSearchParams(location.search).get("q");
