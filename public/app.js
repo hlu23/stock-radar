@@ -14,6 +14,8 @@ let pollTimer;
 let refreshBusy = false;
 let activeSymbol = "";
 let activeBias = "중립";
+let lastShares = null;
+let lastMarketCap = null;
 let savedTimeRange = null;
 let savedLogicalRange = null;
 let lockedTrade = null;
@@ -166,10 +168,8 @@ function renderGainers() {
       const minPct = row.minuteChangePct;
       const surge = row.volSurgePct;
       const delta = row.volDelta;
-      const deltaTone = delta == null ? "" : delta >= 0 ? "up" : "down";
-      const deltaTxt = delta == null
-        ? "-"
-        : `${delta >= 0 ? "+" : "-"}${fmtAmt(Math.abs(delta))}`;
+      const deltaTone = delta > 0 ? "up" : "";
+      const deltaTxt = delta == null ? "-" : fmtAmt(delta);
       return `
       <tr data-symbol="${escapeHtml(row.symbol)}">
         <td>${i + 1}</td>
@@ -248,6 +248,8 @@ async function runScan(q) {
     const resetView = nextSymbol !== activeSymbol;
     activeBias = data.condition || "중립";
     if (resetView) {
+      lastShares = null;
+      lastMarketCap = null;
       lastBuySignal = false;
       buyArmed = false;
       buyAlertOpen = false;
@@ -322,9 +324,20 @@ function render(data) {
   if (data.disclaimer) document.getElementById("disclaimer").textContent = data.disclaimer;
 }
 
+function fmtCap(n) {
+  if (n == null || Number.isNaN(Number(n))) return "-";
+  return `$${fmtAmt(Number(n))}`;
+}
+
 function renderQuote(quote) {
   const priceEl = document.getElementById("price");
   const changeEl = document.getElementById("change");
+  const sharesEl = document.getElementById("shares-out");
+  const capEl = document.getElementById("market-cap");
+  if (quote?.shares != null) lastShares = quote.shares;
+  if (quote?.marketCap != null) lastMarketCap = quote.marketCap;
+  if (sharesEl) sharesEl.textContent = fmtAmt(quote?.shares ?? lastShares);
+  if (capEl) capEl.textContent = fmtCap(quote?.marketCap ?? lastMarketCap);
   if (quote?.price != null) {
     priceEl.textContent = `${fmtNum(quote.price)} ${quote.currency || ""}`.trim();
     const sign = quote.change >= 0 ? "+" : "";
@@ -713,7 +726,11 @@ function chartTheme() {
   return {
     layout: { background: { color: "#141a2e" }, textColor: "#9aa6c8" },
     grid: { vertLines: { color: "#2a3354" }, horzLines: { color: "#2a3354" } },
-    rightPriceScale: { borderColor: "#2a3354" },
+    rightPriceScale: {
+      borderColor: "#2a3354",
+      minimumWidth: 76,
+      entireTextOnly: true,
+    },
     localization: { timeFormatter: (time) => etClock(time) },
     autoSize: true,
     handleScroll: {
@@ -731,14 +748,47 @@ function chartTheme() {
   };
 }
 
+function volPriceLabel(price) {
+  const n = Number(price);
+  if (!Number.isFinite(n) || n <= 0) return "0";
+  if (n >= 1e6) return `${(n / 1e6).toFixed(n >= 10e6 ? 0 : 1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(n >= 10e3 ? 0 : 1)}K`;
+  return String(Math.round(n));
+}
+
+function alignChartPanes() {
+  if (!chart || !volChart) return;
+  const range = chart.timeScale().getVisibleLogicalRange();
+  if (!range) return;
+  const prevIgnore = ignoreRangeEvent;
+  ignoreRangeEvent = true;
+  try {
+    volChart.timeScale().setVisibleLogicalRange(range);
+    const opt = chart.timeScale().options();
+    if (opt?.barSpacing != null) {
+      volChart.timeScale().applyOptions({
+        barSpacing: opt.barSpacing,
+        rightOffset: opt.rightOffset,
+      });
+    }
+  } catch {}
+  ignoreRangeEvent = prevIgnore;
+  applyVolumeScale(chart.timeScale().getVisibleRange());
+}
+
 function ensureChart() {
   if (chart) return;
   const el = document.getElementById("chart");
   const volEl = document.getElementById("chart-vol");
+  const sharedTime = {
+    borderColor: "#2a3354",
+    rightOffset: 4,
+    lockVisibleTimeRangeOnResize: true,
+  };
   chart = LightweightCharts.createChart(el, {
     ...chartTheme(),
     timeScale: {
-      borderColor: "#2a3354",
+      ...sharedTime,
       visible: false,
       timeVisible: false,
       secondsVisible: false,
@@ -746,6 +796,10 @@ function ensureChart() {
   });
   volChart = LightweightCharts.createChart(volEl, {
     ...chartTheme(),
+    localization: {
+      timeFormatter: (time) => etClock(time),
+      priceFormatter: volPriceLabel,
+    },
     handleScroll: {
       mouseWheel: false,
       pressedMouseMove: true,
@@ -759,7 +813,7 @@ function ensureChart() {
       axisDoubleClickReset: true,
     },
     timeScale: {
-      borderColor: "#2a3354",
+      ...sharedTime,
       timeVisible: true,
       secondsVisible: false,
       tickMarkFormatter: (time) => etClock(time),
@@ -768,6 +822,7 @@ function ensureChart() {
   new ResizeObserver(() => {
     chart?.applyOptions({});
     volChart?.applyOptions({});
+    requestAnimationFrame(alignChartPanes);
   }).observe(el.parentElement || el);
   candleSeries = chart.addCandlestickSeries({
     upColor: "#3ee0a2",
@@ -794,16 +849,38 @@ function ensureChart() {
     syncingRange = true;
     try {
       target.timeScale().setVisibleLogicalRange(range);
+      if (source === chart) {
+        const opt = chart.timeScale().options();
+        if (opt?.barSpacing != null) {
+          volChart.timeScale().applyOptions({
+            barSpacing: opt.barSpacing,
+            rightOffset: opt.rightOffset,
+          });
+        }
+        savedLogicalRange = range;
+        savedTimeRange = chart.timeScale().getVisibleRange();
+        applyVolumeScale(savedTimeRange);
+      }
     } catch {}
     syncingRange = false;
-    if (source === chart) {
-      savedLogicalRange = range;
-      savedTimeRange = chart.timeScale().getVisibleRange();
-      applyVolumeScale(savedTimeRange);
-    }
   };
   chart.timeScale().subscribeVisibleLogicalRangeChange(syncFrom(chart, volChart));
   volChart.timeScale().subscribeVisibleLogicalRangeChange(syncFrom(volChart, chart));
+  let syncingCrosshair = false;
+  const followCrosshair = (to, series) => (param) => {
+    if (syncingCrosshair) return;
+    if (!param?.time || param.point == null) {
+      try { to.clearCrosshairPosition(); } catch {}
+      return;
+    }
+    const bar = lastBarsByTime.get(Number(param.time)) || lastBarsByTime.get(param.time);
+    const px = series === volumeSeries ? (bar?.volume || 0) : (bar?.close || 0);
+    syncingCrosshair = true;
+    try { to.setCrosshairPosition(px, param.time, series); } catch {}
+    syncingCrosshair = false;
+  };
+  chart.subscribeCrosshairMove(followCrosshair(volChart, volumeSeries));
+  volChart.subscribeCrosshairMove(followCrosshair(chart, candleSeries));
   bindChartTip();
 }
 
@@ -982,25 +1059,18 @@ function drawChart(candles, plan, { resetView = false } = {}) {
   if (resetView) lastDrawnBarTime = 0;
   if (resetView || !keepLogical) {
     const focus = sessionFocusRange(data);
-    if (focus) {
-      chart.timeScale().setVisibleRange(focus);
-      volChart.timeScale().setVisibleRange(focus);
-    } else {
-      chart.timeScale().fitContent();
-      volChart.timeScale().fitContent();
-    }
-    savedLogicalRange = chart.timeScale().getVisibleLogicalRange();
-    if (savedLogicalRange) volChart.timeScale().setVisibleLogicalRange(savedLogicalRange);
+    if (focus) chart.timeScale().setVisibleRange(focus);
+    else chart.timeScale().fitContent();
   } else {
     const next = followLiveLogicalRange(keepLogical, data, lastDrawnBarTime);
     chart.timeScale().setVisibleLogicalRange(next);
-    volChart.timeScale().setVisibleLogicalRange(next);
-    savedLogicalRange = next;
   }
+  alignChartPanes();
+  savedLogicalRange = chart.timeScale().getVisibleLogicalRange();
   savedTimeRange = chart.timeScale().getVisibleRange();
-  applyVolumeScale(savedTimeRange);
   lastDrawnBarTime = last?.time || lastDrawnBarTime;
   ignoreRangeEvent = false;
+  requestAnimationFrame(alignChartPanes);
 }
 
 function applyLines() {
@@ -1054,7 +1124,7 @@ async function refreshChart() {
       renderPlan(data.plan);
     }
     document.getElementById("chart-live").textContent =
-      `${data.marketState || data.plan?.stats?.marketState || ""} · 실시간 현재가 ${fmtNum(data.price ?? data.quote?.price ?? "")} · ${new Date().toLocaleTimeString("ko-KR", { hour12: false })}`;
+      `${data.marketState || data.plan?.stats?.marketState || ""} · ${data.tape === "kiwoom" ? "키움" : "야후"} 1분봉 · 실시간 현재가 ${fmtNum(data.price ?? data.quote?.price ?? "")} · ${new Date().toLocaleTimeString("ko-KR", { hour12: false })}`;
   } catch (err) {
     document.getElementById("chart-live").textContent = err.message;
   } finally {

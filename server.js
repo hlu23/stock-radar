@@ -155,9 +155,12 @@ let kiwoomDownMsg = "";
 
 function signedNum(value) {
   if (value == null || value === "") return 0;
-  const text = String(value).trim().replace(/,/g, "");
-  const n = Number(text.replace(/^[+-]/, ""));
+  const n = Number(String(value).trim().replace(/,/g, ""));
   return Number.isFinite(n) ? n : 0;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function kiwoomExpires(expiresDt) {
@@ -249,27 +252,27 @@ async function kiwoomToken() {
   return kiwoomTokenInflight;
 }
 
-async function kiwoomPost(path, apiId, body, retried = false) {
+async function kiwoomRequest(path, apiId, body, { retried = false, contYn = "N", nextKey = "" } = {}) {
   if (Date.now() < kiwoomAuthDownUntil) {
     throw new Error(kiwoomDownMsg || "키움 인증 대기");
   }
   const token = await kiwoomToken();
-  if (!token) return null;
+  if (!token) return { data: null, contYn: "N", nextKey: "" };
   const res = await fetch(`${KIWOOM_BASE}${path}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json;charset=UTF-8",
       authorization: `Bearer ${token}`,
       "api-id": apiId,
-      "cont-yn": "N",
-      "next-key": "",
+      "cont-yn": contYn || "N",
+      "next-key": nextKey || "",
     },
     body: JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
   if (data.return_code === 8005 && !retried) {
     kiwoomAuth = { token: "", exp: 0 };
-    return kiwoomPost(path, apiId, body, true);
+    return kiwoomRequest(path, apiId, body, { retried: true, contYn, nextKey });
   }
   if (data.return_code === 8005) {
     kiwoomAuthDownUntil = Date.now() + 45_000;
@@ -279,7 +282,32 @@ async function kiwoomPost(path, apiId, body, retried = false) {
   if (!res.ok || (data.return_code != null && data.return_code !== 0)) {
     throw new Error(data.return_msg || `키움 ${apiId} 실패 ${data.return_code ?? res.status}`);
   }
+  return {
+    data,
+    contYn: res.headers.get("cont-yn") || "N",
+    nextKey: res.headers.get("next-key") || "",
+  };
+}
+
+async function kiwoomPost(path, apiId, body, retried = false) {
+  const { data } = await kiwoomRequest(path, apiId, body, { retried });
   return data;
+}
+
+async function kiwoomListPages(path, apiId, body, maxPages = 3) {
+  const rows = [];
+  let contYn = "N";
+  let nextKey = "";
+  for (let page = 0; page < maxPages; page += 1) {
+    const pack = await kiwoomRequest(path, apiId, body, { contYn, nextKey });
+    const list = pack.data?.result_list || pack.data?.trde_qty_sdnin || [];
+    if (Array.isArray(list)) rows.push(...list);
+    if (pack.contYn !== "Y" || !pack.nextKey) break;
+    contYn = "Y";
+    nextKey = pack.nextKey;
+    if (page + 1 < maxPages) await sleep(200);
+  }
+  return rows;
 }
 
 function etYyyymmdd(offsetDays = 0) {
@@ -312,9 +340,16 @@ async function kiwoomSession(symbol, exchangeHint) {
   }
   const code = String(symbol).toUpperCase().split(".")[0];
   const cached = kiwoomBarCache.get(code);
+  const liveQ = liveBoard.get(code);
   const barsOk = cached && now - cached.barAt < 20_000 && cached.pack?.bars?.length;
-  const quoteOk = cached && now - cached.quoteAt < 2_000 && cached.pack?.quote;
-  if (barsOk && quoteOk) return cached.pack;
+  const quoteOk = (cached && now - cached.quoteAt < 5_000 && cached.pack?.quote)
+    || (liveQ?.quote && now - (liveQ.kwAt || 0) < 3_000);
+  if (barsOk && quoteOk) {
+    if (liveQ?.quote && cached?.pack) {
+      return { ...cached.pack, quote: liveQ.quote };
+    }
+    return cached?.pack || { bars: cached?.pack?.bars || [], quote: liveQ.quote, exchange: cached?.pack?.exchange };
+  }
 
   const preferred = kiwoomExCache.get(code);
   const exchanges = preferred ? [preferred] : kiwoomExchanges(exchangeHint);
@@ -352,22 +387,24 @@ async function kiwoomSession(symbol, exchangeHint) {
       const bars = barsOk
         ? cached.pack.bars
         : kiwoomPerMinuteBars(chart?.result_list);
-      const quote = quoteOk ? cached.pack.quote : mapKiwoomQuote(quoteRow);
+      const quote = quoteOk
+        ? (cached?.pack?.quote || liveQ?.quote)
+        : mapKiwoomQuote(quoteRow);
       if (!bars.length && !quote) {
         lastError = new Error(`${code} ${stex_tp} 시세 없음`);
         continue;
       }
       kiwoomExCache.set(code, stex_tp);
       const pack = {
-        bars: bars.length ? bars : (cached?.pack.bars || []),
-        quote: quote || cached?.pack.quote || null,
+        bars: bars.length ? bars : (cached?.pack?.bars || []),
+        quote: quote || cached?.pack?.quote || liveQ?.quote || null,
         exchange: stex_tp,
       };
       rememberKiwoom(
         code,
         pack,
         barsOk || !needBars ? (cached?.barAt || now) : now,
-        quoteOk ? cached.quoteAt : now,
+        quoteOk ? (cached?.quoteAt || now) : now,
       );
       return pack;
     } catch (err) {
@@ -443,16 +480,37 @@ function kiwoomPerMinuteBars(rows) {
   });
 }
 
+function kiwoomMarketCap(mac, shares, last) {
+  if (!(mac > 0)) return null;
+  const asUsd = mac;
+  const asThousand = mac * 1000;
+  const implied = shares > 0 && last > 0 ? shares * last : null;
+  if (implied > 0) {
+    const dUsd = Math.abs(Math.log(asUsd / implied));
+    const dThou = Math.abs(Math.log(asThousand / implied));
+    return dThou <= dUsd ? asThousand : asUsd;
+  }
+  return asThousand;
+}
+
 function mapKiwoomQuote(row) {
   if (!row) return null;
   const last = signedNum(row.cur_prc);
   if (!(last > 0)) return null;
   const volume = signedNum(row.acc_trde_qty) || null;
   const turnover = signedNum(row.trde_prica) || signedNum(row.acc_trde_prica) || null;
+  const prevClose = signedNum(row.base_close_pric);
+  const fluRt = signedNum(row.flu_rt);
+  const shares = signedNum(row.stk_cnt);
+  const marketCap = kiwoomMarketCap(signedNum(row.mac), shares, last);
   return {
     last,
     volume,
     turnover: turnover || null,
+    prevClose: prevClose > 0 ? prevClose : null,
+    fluRt: Number.isFinite(fluRt) ? fluRt : null,
+    shares: shares > 0 ? shares : null,
+    marketCap,
     bid: signedNum(row.buy_bid1 || row.bid_uv || row.buy_uv) || null,
     ask: signedNum(row.sel_bid1 || row.ask_uv || row.sel_uv) || null,
   };
@@ -462,7 +520,10 @@ let kiwoomRankCache = { at: 0, rows: [], basis: "" };
 const quoteTape = new Map();
 const liveBoard = new Map();
 const rthCloseBySym = new Map();
+const priceTape = new Map();
+const volumeTape = new Map();
 let liveKickBusy = false;
+let kiwoomQuoteCursor = 0;
 let boardEtDay = "";
 
 function etDateKey(d = new Date()) {
@@ -489,7 +550,78 @@ function resetUsBoardIfNewEtDay() {
   liveBoard.clear();
   quoteTape.clear();
   rthCloseBySym.clear();
+  priceTape.clear();
+  volumeTape.clear();
+  kiwoomQuoteCursor = 0;
   return true;
+}
+
+function clockMinute() {
+  return Math.floor(Date.now() / 60_000) * 60_000;
+}
+
+function rememberVolumeTape(symbol, volume) {
+  const code = String(symbol || "").toUpperCase().split(".")[0];
+  if (!code) return 0;
+  const minute = clockMinute();
+  const cur = volumeTape.get(code);
+  if (!cur || cur.minute !== minute) {
+    if (!(volume > 0) && !(cur?.lastVol > 0)) return 0;
+    const startVol = cur?.lastVol > 0 ? cur.lastVol : volume;
+    const lastVol = volume > 0 ? volume : startVol;
+    volumeTape.set(code, { minute, startVol, lastVol });
+    return lastVol > startVol ? Math.round(lastVol - startVol) : 0;
+  }
+  if (volume > 0) cur.lastVol = Math.max(cur.lastVol || 0, volume);
+  return cur.lastVol > cur.startVol ? Math.round(cur.lastVol - cur.startVol) : 0;
+}
+
+function minuteVolAdd(symbol, volume) {
+  return rememberVolumeTape(symbol, volume);
+}
+
+function compareLiveRank(a, b) {
+  const a1 = Number.isFinite(Number(a.minuteChangePct)) ? Number(a.minuteChangePct) : 0;
+  const b1 = Number.isFinite(Number(b.minuteChangePct)) ? Number(b.minuteChangePct) : 0;
+  if (b1 !== a1) return b1 - a1;
+  return (b.minuteVolAdd ?? -1) - (a.minuteVolAdd ?? -1)
+    || (b.volDelta ?? -1) - (a.volDelta ?? -1)
+    || (b.volSurgePct ?? -1) - (a.volSurgePct ?? -1);
+}
+
+function rememberPriceTape(symbol, px) {
+  const code = String(symbol || "").toUpperCase().split(".")[0];
+  if (!code || !(px > 0)) return;
+  const now = Date.now();
+  const arr = priceTape.get(code) || [];
+  if (!arr.length) arr.push({ t: now - 8_000, px });
+  const last = arr.at(-1);
+  if (last && now - last.t < 400 && Math.abs(last.px - px) < 1e-12) {
+    priceTape.set(code, arr);
+    return;
+  }
+  arr.push({ t: now, px });
+  priceTape.set(code, arr.filter((p) => now - p.t < 3 * 60 * 1000).slice(-180));
+}
+
+function minuteChangeFromTape(symbol, px) {
+  const code = String(symbol || "").toUpperCase().split(".")[0];
+  if (!code || !(px > 0)) return null;
+  const arr = priceTape.get(code) || [];
+  if (!arr.length) return null;
+  const now = Date.now();
+  const lastPx = arr.at(-1)?.px || px;
+  const target = now - 60_000;
+  let prev = null;
+  for (const p of arr) {
+    if (p.t <= target) prev = p;
+  }
+  if (!prev?.px) {
+    prev = arr[0];
+    if (!prev?.px || now - prev.t < 8_000) return null;
+  }
+  if (!(prev.px > 0)) return null;
+  return Number((((lastPx - prev.px) / prev.px) * 100).toFixed(2));
 }
 
 function pctFromClose(price, close) {
@@ -532,7 +664,9 @@ function rememberLiveBoard(symbol, patch) {
   if (!code) return;
   const cur = liveBoard.get(code) || {};
   liveBoard.set(code, { ...cur, ...patch, at: Date.now() });
-  if (liveBoard.size > 80) liveBoard.delete(liveBoard.keys().next().value);
+  if (patch.price > 0) rememberPriceTape(code, patch.price);
+  if (patch.volume > 0) rememberVolumeTape(code, patch.volume);
+  if (liveBoard.size > 200) liveBoard.delete(liveBoard.keys().next().value);
 }
 
 function overlayLiveBoard(rows) {
@@ -540,29 +674,43 @@ function overlayLiveBoard(rows) {
   return rows.map((row) => {
     const live = liveBoard.get(row.symbol);
     const price = live?.price || row.price;
-    const volume = live?.kwAt && live.volume > 0 ? live.volume : (live?.volume || row.volume);
+    const liveVol = live?.volume > 0 ? live.volume : null;
+    const volume = liveVol != null ? Math.max(liveVol, row.volume || 0) : row.volume;
     const turnover = price > 0 && volume > 0
       ? price * volume
       : (live?.turnover || row.turnover || null);
     const avgVol = row.avgVol || live?.avgVol || null;
     const stats = sessionVolumeStats(volume, avgVol);
-    const fromKiwoom = row.volSurgePct != null || row.source === "volume" || row.source === "surge";
     const rthClose = live?.rthClose || rthCloseBySym.get(row.symbol);
+    if (price > 0) rememberPriceTape(row.symbol, price);
     let dayChangePct = row.dayChangePct ?? row.changePct ?? null;
-    if (session === "POST" || (session === "CLOSED" && rthClose > 0)) {
-      dayChangePct = pctFromClose(price, rthClose) ?? live?.postChangePct ?? 0;
+    if (session === "PRE" || session === "POST" || (session === "CLOSED" && rthClose > 0)) {
+      dayChangePct = pctFromClose(price, rthClose) ?? live?.fluRt ?? live?.postChangePct ?? dayChangePct;
     }
+    const min1 = minuteChangeFromTape(row.symbol, price)
+      ?? live?.minuteChangePct
+      ?? row.minuteChangePct
+      ?? null;
+    if (min1 != null) {
+      const cur = liveBoard.get(row.symbol) || {};
+      liveBoard.set(row.symbol, { ...cur, minuteChangePct: min1, at: cur.at || Date.now() });
+    }
+    const add = minuteVolAdd(row.symbol, liveVol ?? (volume > 0 ? volume : null));
+    const relVol = stats.relVol ?? row.relVol;
     return {
       ...row,
       price,
       volume,
       turnover,
-      avgVol: fromKiwoom ? row.avgVol : avgVol,
-      volSurgePct: row.volSurgePct ?? stats.volSurgePct,
-      volDelta: row.volDelta ?? (fromKiwoom ? null : stats.volDelta),
-      relVol: row.relVol ?? (fromKiwoom ? row.relVol : stats.relVol),
+      avgVol,
+      volSurgePct: stats.volSurgePct ?? row.volSurgePct,
+      volDelta: add,
+      relVol,
+      minuteVolAdd: add || null,
       dayChangePct,
       changePct: dayChangePct,
+      minuteChangePct: min1,
+      heat: minuteHeat(min1, relVol ?? row.minuteRelVol),
     };
   });
 }
@@ -588,13 +736,29 @@ async function applyYahooLive(rows) {
   }
 }
 
+function pickLiveQuoteBatch(rows) {
+  if (!rows?.length) return [];
+  const hotN = Math.min(15, rows.length);
+  const hot = rows.slice(0, hotN);
+  const a = hot[kiwoomQuoteCursor % hotN];
+  const b = hot[(kiwoomQuoteCursor * 5 + 3) % hotN];
+  const c = rows[kiwoomQuoteCursor % rows.length];
+  kiwoomQuoteCursor += 1;
+  const seen = new Set();
+  return [a, b, c].filter((row) => {
+    if (!row?.symbol || seen.has(row.symbol)) return false;
+    seen.add(row.symbol);
+    return true;
+  });
+}
+
 function kickKiwoomLive(rows) {
   if (liveKickBusy || !KIWOOM_APP_KEY || Date.now() < kiwoomAuthDownUntil) return;
-  const now = Date.now();
-  const need = rows.filter((r) => now - (liveBoard.get(r.symbol)?.kwAt || 0) > 1200).slice(0, 6);
-  if (!need.length) return;
+  if (!rows?.length) return;
+  const batch = pickLiveQuoteBatch(rows);
+  if (!batch.length) return;
   liveKickBusy = true;
-  mapLimit(need, 3, async (row) => {
+  mapLimit(batch, 3, async (row) => {
     try {
       const q = await kiwoomQuoteOnly(row.symbol, row.exchange);
       if (!q) return;
@@ -602,14 +766,17 @@ function kickKiwoomLive(rows) {
       const price = q.last || prev.price || row.price;
       const volume = q.volume || prev.volume || row.volume;
       const turnover = q.turnover || prev.turnover;
-      if (tapeSessionNow() === "REGULAR" && price > 0) rememberRthClose(row.symbol, price);
+      const session = tapeSessionNow();
+      if (q.prevClose > 0) rememberRthClose(row.symbol, q.prevClose);
+      if (session === "REGULAR" && price > 0) rememberRthClose(row.symbol, price);
       rememberLiveBoard(row.symbol, {
         price,
         volume,
         turnover,
         quote: q,
+        fluRt: q.fluRt,
         kwAt: Date.now(),
-        rthClose: rthCloseBySym.get(row.symbol) || prev.rthClose,
+        rthClose: rthCloseBySym.get(row.symbol) || q.prevClose || prev.rthClose,
       });
     } catch {}
   }).finally(() => {
@@ -619,7 +786,9 @@ function kickKiwoomLive(rows) {
 
 async function liveBoardRows(rows) {
   if (!rows?.length) return rows;
-  await applyYahooLive(rows).catch(() => {});
+  if (!KIWOOM_APP_KEY || Date.now() < kiwoomAuthDownUntil) {
+    await applyYahooLive(rows).catch(() => {});
+  }
   kickKiwoomLive(rows);
   return overlayLiveBoard(rows);
 }
@@ -707,6 +876,10 @@ function mapKiwoomRankRow(row, kind) {
   }
   const turnover = signedNum(row.trde_prica) || (price && volume ? price * volume : 0);
   const relVol = prevVol && volume ? volume / prevVol : (volSurgePct ? 1 + volSurgePct / 100 : null);
+  const avgVol = prevVol
+    || (volume > 0 && Number.isFinite(volSurgePct) && volSurgePct !== -100
+      ? volume / (1 + volSurgePct / 100)
+      : null);
   return {
     symbol,
     name: row.stk_nm || row.stk_enm || symbol,
@@ -718,7 +891,7 @@ function mapKiwoomRankRow(row, kind) {
     changePct: Number.isFinite(changePct) ? changePct : null,
     volume: volume || null,
     turnover: turnover || null,
-    avgVol: prevVol || null,
+    avgVol: avgVol > 0 ? avgVol : null,
     volDelta: Number.isFinite(volDelta) ? volDelta : null,
     volSurgePct: Number.isFinite(volSurgePct) ? Number(volSurgePct.toFixed(2)) : null,
     relVol: relVol != null ? Number(relVol.toFixed(2)) : null,
@@ -729,19 +902,24 @@ function mapKiwoomRankRow(row, kind) {
   };
 }
 
-async function kiwoomRankList(apiId, body) {
-  const data = await kiwoomPost("/api/us/rkinfo", apiId, body);
-  const list = data?.result_list || data?.trde_qty_sdnin || [];
-  return Array.isArray(list) ? list : [];
-}
+const KIWOOM_SURGE_BODY = {
+  stex_tp: "0",
+  inds_cd: "",
+  tm: "5",
+  stk_tp: "1",
+  stk_cnd: "0",
+  pric_cnd: "0",
+  trde_prica_cnd: "0",
+  trde_qty_tp: "0",
+};
 
 const KIWOOM_RANK_BODY = {
   stex_tp: "0",
   inds_cd: "",
-  stk_tp: "0",
+  stk_tp: "1",
   trde_qty_tp: "0",
   qry_tp: "0",
-  stk_cnd: "0",
+  stk_cnd: "2",
   pric_cnd: "0",
   trde_prica_cnd: "0",
 };
@@ -751,43 +929,48 @@ async function kiwoomVolumeBoard() {
   if (Date.now() < kiwoomAuthDownUntil) {
     return kiwoomRankCache.rows.length ? kiwoomRankCache : { at: 0, rows: [], basis: "" };
   }
-  if (Date.now() - kiwoomRankCache.at < 25_000 && kiwoomRankCache.rows.length) {
+  if (Date.now() - kiwoomRankCache.at < 12_000 && kiwoomRankCache.rows.length) {
     return kiwoomRankCache;
   }
-  const [volRows, valueRows] = await Promise.all([
-    kiwoomRankList("usa20530", KIWOOM_RANK_BODY).catch((err) => {
+  let raw = [];
+  let basis = "";
+  try {
+    raw = await kiwoomListPages("/api/us/stkinfo", "usa20520", KIWOOM_SURGE_BODY, 3);
+    if (raw.length) basis = "kiwoom-surge";
+  } catch (err) {
+    console.warn("kiwoom usa20520:", err.message);
+  }
+  if (!raw.length) {
+    try {
+      raw = await kiwoomListPages("/api/us/rkinfo", "usa20530", KIWOOM_RANK_BODY, 2);
+      if (raw.length) basis = "kiwoom-volume-up50";
+    } catch (err) {
       console.warn("kiwoom usa20530:", err.message);
-      return [];
-    }),
-    kiwoomRankList("usa20540", { ...KIWOOM_RANK_BODY, qry_tp: "1" }).catch((err) => {
-      console.warn("kiwoom usa20540:", err.message);
-      return [];
-    }),
-  ]);
+    }
+  }
+  if (!raw.length) {
+    try {
+      raw = await kiwoomListPages("/api/us/rkinfo", "usa20530", { ...KIWOOM_RANK_BODY, stk_cnd: "0", stk_tp: "0" }, 2);
+      if (raw.length) basis = "kiwoom-volume";
+    } catch (err) {
+      console.warn("kiwoom usa20530 fallback:", err.message);
+    }
+  }
   const bySym = new Map();
-  let rank = 0;
-  for (const row of volRows.map((r) => mapKiwoomRankRow(r, "volume")).filter(Boolean)) {
-    bySym.set(row.symbol, { ...row, kiwoomRank: rank });
-    rank += 1;
+  for (const mapped of raw.map((r) => mapKiwoomRankRow(r, "surge")).filter(Boolean)) {
+    const cur = bySym.get(mapped.symbol);
+    if (!cur || (mapped.volSurgePct ?? -1) > (cur.volSurgePct ?? -1)) {
+      bySym.set(mapped.symbol, mapped);
+    }
   }
-  for (const row of valueRows.map((r) => mapKiwoomRankRow(r, "surge")).filter(Boolean)) {
-    const cur = bySym.get(row.symbol);
-    bySym.set(row.symbol, cur
-      ? {
-        ...cur,
-        turnover: row.turnover || cur.turnover,
-        volSurgePct: cur.volSurgePct || row.volSurgePct,
-        volume: cur.volume || row.volume,
-      }
-      : { ...row, kiwoomRank: rank++ });
-  }
-  const rows = [...bySym.values()].filter((r) => isGainerName(r) || r.source === "surge" || r.source === "volume");
-  rows.sort((a, b) => (a.kiwoomRank ?? 9999) - (b.kiwoomRank ?? 9999) || (b.volSurgePct ?? -1) - (a.volSurgePct ?? -1));
-  const pack = {
-    at: Date.now(),
-    rows,
-    basis: volRows.length ? "kiwoom-volume" : (valueRows.length ? "kiwoom-turnover" : ""),
-  };
+  let rows = [...bySym.values()].filter((r) => (r.volSurgePct ?? 0) > 0);
+  const gainers = rows.filter(isGainerName);
+  if (gainers.length) rows = gainers;
+  rows.sort((a, b) => (b.volSurgePct ?? -1) - (a.volSurgePct ?? -1) || (b.volume ?? 0) - (a.volume ?? 0));
+  rows.forEach((row, i) => {
+    row.kiwoomRank = i;
+  });
+  const pack = { at: Date.now(), rows, basis };
   if (rows.length) kiwoomRankCache = pack;
   return pack;
 }
@@ -1160,6 +1343,8 @@ function packQuote(p) {
     regularMarketPrice: rawNum(p.regularMarketPrice ?? p.last),
     postMarketChangePercent: rawNum(p.postMarketChangePercent),
     preMarketChangePercent: rawNum(p.preMarketChangePercent),
+    marketCap: rawNum(p.marketCap),
+    shares: rawNum(p.sharesOutstanding) || rawNum(p.impliedSharesOutstanding),
   };
 }
 
@@ -2246,31 +2431,83 @@ function candlePayload(chart) {
   }));
 }
 
+function barsToChart(symbol, bars, quote) {
+  if (!bars?.length) return null;
+  const state = tapeSessionNow();
+  const last = bars.at(-1);
+  const live = quote?.last || last?.c;
+  return {
+    meta: {
+      symbol,
+      currency: "USD",
+      exchangeName: "US",
+      marketState: state === "PRE" ? "PRE" : state === "POST" ? "POST" : state === "REGULAR" ? "REGULAR" : "CLOSED",
+      regularMarketPrice: live,
+      preMarketPrice: state === "PRE" ? live : undefined,
+      postMarketPrice: state === "POST" || state === "CLOSED" ? live : undefined,
+      chartPreviousClose: quote?.prevClose || undefined,
+      regularMarketTime: last?.t,
+      regularMarketVolume: quote?.volume,
+    },
+    timestamp: bars.map((b) => b.t),
+    indicators: {
+      quote: [{
+        open: bars.map((b) => b.o),
+        high: bars.map((b) => b.h),
+        low: bars.map((b) => b.l),
+        close: bars.map((b) => b.c),
+        volume: bars.map((b) => b.v),
+      }],
+    },
+  };
+}
+
+const dailyChartCache = new Map();
+async function yahooDailyCached(symbol) {
+  const hit = dailyChartCache.get(symbol);
+  if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.chart;
+  const chart = await yahooChart(symbol, "1d", "5d").catch(() => null);
+  if (chart) {
+    dailyChartCache.set(symbol, { at: Date.now(), chart });
+    if (dailyChartCache.size > 40) dailyChartCache.delete(dailyChartCache.keys().next().value);
+  }
+  return chart;
+}
+
 async function livePack(symbol, bias, locked) {
-  const [c1m, c1d, quote, kiwoom] = await Promise.all([
-    yahooChart(symbol, "1m", "2d").catch(() => null),
-    yahooChart(symbol, "1d", "5d").catch(() => null),
-    yahooQuote(symbol).catch(() => null),
-    kiwoomSession(symbol).catch((err) => {
-      console.warn("kiwoom:", err.message);
-      return { bars: [], quote: null };
-    }),
+  const kiwoom = await kiwoomSession(symbol).catch((err) => {
+    console.warn("kiwoom:", err.message);
+    return { bars: [], quote: null };
+  });
+  const haveKwBars = Boolean(kiwoom?.bars?.length);
+  const [c1m, c1d, quote] = await Promise.all([
+    haveKwBars ? Promise.resolve(null) : yahooChart(symbol, "1m", "2d").catch(() => null),
+    yahooDailyCached(symbol),
+    kiwoom?.quote?.shares && kiwoom?.quote?.marketCap
+      ? Promise.resolve(null)
+      : yahooQuote(symbol).catch(() => null),
   ]);
-  if (!c1m) throw new Error("1분봉을 못 가져왔습니다.");
-  const chartQ = packQuote(c1m.meta);
+  const chart1m = c1m || barsToChart(symbol, kiwoom?.bars || [], kiwoom?.quote);
+  if (!chart1m) throw new Error("1분봉을 못 가져왔습니다.");
+  const chartQ = packQuote(chart1m.meta);
   const kw = kiwoom?.quote || {};
+  const session = tapeSessionNow();
+  const liveLast = kw.last ?? quote?.last ?? chartQ?.last;
   const merged = {
-    last: quote?.last ?? kw.last ?? chartQ?.last,
-    bid: quote?.bid || kw.bid,
-    ask: quote?.ask || kw.ask,
+    last: liveLast,
+    bid: kw.bid || quote?.bid,
+    ask: kw.ask || quote?.ask,
     bidSize: quote?.bidSize,
     askSize: quote?.askSize,
     volume: kw.volume || quote?.volume,
-    marketState: quote?.marketState || c1m.meta?.marketState || chartQ?.marketState || "",
-    preMarketPrice: quote?.preMarketPrice ?? rawNum(c1m.meta?.preMarketPrice) ?? kw.last,
-    postMarketPrice: quote?.postMarketPrice ?? rawNum(c1m.meta?.postMarketPrice),
+    shares: kw.shares || quote?.shares || null,
+    marketCap: kw.marketCap || quote?.marketCap || null,
+    marketState: session === "PRE" ? "PRE" : session === "POST" ? "POST" : session === "REGULAR" ? "REGULAR" : (quote?.marketState || chart1m.meta?.marketState || chartQ?.marketState || "CLOSED"),
+    preMarketPrice: session === "PRE" ? liveLast : (quote?.preMarketPrice ?? rawNum(chart1m.meta?.preMarketPrice)),
+    postMarketPrice: session === "POST" || session === "CLOSED" ? liveLast : (quote?.postMarketPrice ?? rawNum(chart1m.meta?.postMarketPrice)),
   };
-  const intraday = buildIntraday(c1m, c1d, merged, kiwoom?.bars || []);
+  if (kw.prevClose > 0) rememberRthClose(symbol, kw.prevClose);
+  const intraday = buildIntraday(chart1m, c1d, merged, haveKwBars ? [] : (kiwoom?.bars || []));
   let plan = dayTradePlan(intraday, bias);
   if (locked?.buyPrice != null || locked?.sellPrice != null) {
     plan = applyLockedTrade(plan, locked, intraday);
@@ -2279,7 +2516,7 @@ async function livePack(symbol, bias, locked) {
     symbol: intraday?.symbol || symbol,
     price: intraday?.price,
     marketState: merged?.marketState || intraday?.marketState,
-    candles: intraday?.candles || candlePayload(c1m),
+    candles: intraday?.candles || candlePayload(chart1m),
     quote: intraday
       ? {
         symbol: intraday.symbol,
@@ -2293,11 +2530,13 @@ async function livePack(symbol, bias, locked) {
         askSize: merged?.askSize,
         change: intraday.change,
         changePct: intraday.changePct,
+        shares: merged?.shares ?? null,
+        marketCap: merged?.marketCap ?? null,
         marketState: merged?.marketState || intraday.marketState,
       }
       : null,
     plan,
-    tape: kiwoom?.quote?.volume || (kiwoom?.bars || []).some((b) => b.v > 0) ? "kiwoom" : "yahoo",
+    tape: kw.volume || (kiwoom?.bars || []).some((b) => b.v > 0) ? "kiwoom" : "yahoo",
   };
 }
 
@@ -2559,7 +2798,7 @@ async function attachMinuteChange(rows) {
       if (rthClose) rememberRthClose(row.symbol, rthClose);
       const minute = lastMinuteStats(chart);
       const price = minute?.price || row.price;
-      const afterPct = (session === "POST" || (session === "CLOSED" && rthClose))
+      const afterPct = (session === "PRE" || session === "POST" || (session === "CLOSED" && rthClose))
         ? (pctFromClose(price, rthClose) ?? 0)
         : null;
       if (!minute) {
@@ -2606,18 +2845,15 @@ async function usGainers(params) {
       rows = rows.filter((r) => `${r.symbol} ${r.name}`.toLowerCase().includes(needle));
     }
     if (rows.length) {
-      if (!q && Date.now() - minuteCache.at < 20000 && minuteCache.rows[0]?.source) {
-        return liveBoardRows(minuteCache.rows);
-      }
-      if (!byKiwoom) {
-        rows = await attachMinuteChange(rows.slice(0, 80));
-        rows.sort((a, b) => (b.minuteChangePct ?? -999) - (a.minuteChangePct ?? -999) || (a.kiwoomRank ?? 9999) - (b.kiwoomRank ?? 9999));
-      } else {
-        rows = rows.slice(0, 80);
+      rows = rows.slice(0, 80);
+      rows = await liveBoardRows(rows);
+      if (byKiwoom) {
         rows.sort((a, b) => (a.kiwoomRank ?? 9999) - (b.kiwoomRank ?? 9999));
+      } else {
+        rows.sort(compareLiveRank);
       }
       minuteCache = { at: Date.now(), rows };
-      return liveBoardRows(rows);
+      return rows;
     }
   }
   if (!q && Date.now() - minuteCache.at < 20000 && minuteCache.rows.length) {
@@ -2635,7 +2871,7 @@ async function usGainers(params) {
       row.minuteRelVol ?? (row.minute ? row.relVol : null),
     ),
   }));
-  rows.sort((a, b) => (b.minuteChangePct ?? -999) - (a.minuteChangePct ?? -999) || (b.volSurgePct ?? -1) - (a.volSurgePct ?? -1));
+  rows.sort(compareLiveRank);
   minuteCache = { at: Date.now(), rows };
   return liveBoardRows(rows);
 }
@@ -2675,8 +2911,10 @@ function filterGainers(rows, params) {
     : "dayChangePct";
   if (tapeSessionNow() === "CLOSED" && (sort === "min1" || sort === "kiwoom")) {
     filtered.sort((a, b) => (a.kiwoomRank ?? 9999) - (b.kiwoomRank ?? 9999));
+  } else if (sort === "min1") {
+    filtered.sort(compareLiveRank);
   } else {
-    filtered.sort((a, b) => (b[key] ?? -999) - (a[key] ?? -999));
+    filtered.sort((a, b) => (b[key] ?? -999) - (a[key] ?? -999) || (b.volDelta ?? -1) - (a.volDelta ?? -1));
   }
   return filtered.slice(0, limit);
 }

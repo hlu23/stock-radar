@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Stock Radar V2 — 미장 급등주</title>
-    <link rel="stylesheet" href="/styles.css?v=2.7" />
+    <link rel="stylesheet" href="/styles.css?v=2.8" />
   </head>
   <body>
     <main class="shell">
@@ -97,7 +97,7 @@
               <option value="turnover">거래대금</option>
               <option value="pct">하루 등락</option>
               <option value="heat">1분 점수</option>
-              <option value="delta">거래량 증가</option>
+              <option value="delta">1분 거래량</option>
               <option value="rel">상대거래량</option>
             </select>
           </label>
@@ -114,7 +114,7 @@
                 <th class="num">1분 등락</th>
                 <th class="num">거래량</th>
                 <th class="num">급증률</th>
-                <th class="num">거래량 증가</th>
+                <th class="num">1분 거래량</th>
                 <th class="num">거래대금</th>
                 <th class="num">1분 점수</th>
               </tr>
@@ -169,6 +169,16 @@
           <div class="price-box">
             <p id="price" class="price"></p>
             <p id="change" class="change"></p>
+          </div>
+          <div class="size-box">
+            <div class="size-item">
+              <span>주식수</span>
+              <strong id="shares-out">-</strong>
+            </div>
+            <div class="size-item">
+              <span>시가총액</span>
+              <strong id="market-cap">-</strong>
+            </div>
           </div>
           <div id="condition" class="badge"></div>
         </article>
@@ -235,6 +245,6 @@
       </section>
     </main>
     <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
-    <script src="/app.js?v=3.9"></script>
+    <script src="/app.js?v=4.3"></script>
   </body>
 </html>
