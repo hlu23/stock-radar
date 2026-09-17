@@ -7,9 +7,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 loadDotEnv();
 const PUBLIC_DIR = path.join(__dirname, "public");
 const PORT = Number(process.env.PORT || 8787);
-const TOSS_BASE = "https://openapi.tossinvest.com";
-const TOSS_CLIENT_ID = process.env.TOSS_CLIENT_ID || "";
-const TOSS_CLIENT_SECRET = process.env.TOSS_CLIENT_SECRET || "";
+const KIWOOM_HOST = (process.env.KIWOOM_HOST || "real").toLowerCase();
+const KIWOOM_APP_KEY = process.env.KIWOOM_APP_KEY || "";
+const KIWOOM_SECRET_KEY = process.env.KIWOOM_SECRET_KEY || "";
+const KIWOOM_BASE = process.env.KIWOOM_API_BASE
+  || (KIWOOM_HOST === "demo" ? "https://mockapi.kiwoom.com" : "https://api.kiwoom.com");
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const UA =
@@ -143,108 +145,657 @@ async function yahooJson(url) {
   return res.json();
 }
 
-let tossAuth = { token: "", exp: 0 };
-let tossBarCache = { symbol: "", at: 0, bars: [] };
+let kiwoomAuth = { token: "", exp: 0 };
+let kiwoomAuthDownUntil = 0;
+let kiwoomTokenInflight = null;
+const kiwoomBarCache = new Map();
+let kiwoomExCache = new Map();
+let kiwoomChartDownUntil = 0;
+let kiwoomDownMsg = "";
 
-function unwrapToss(payload) {
-  if (payload?.error) {
-    throw new Error(payload.error.message || payload.error.code || "토스 API 오류");
-  }
-  return payload?.result ?? payload;
+function signedNum(value) {
+  if (value == null || value === "") return 0;
+  const text = String(value).trim().replace(/,/g, "");
+  const n = Number(text.replace(/^[+-]/, ""));
+  return Number.isFinite(n) ? n : 0;
 }
 
-function tossTs(value) {
-  if (value == null) return null;
-  if (typeof value === "number") return value > 1e12 ? Math.floor(value / 1000) : Math.floor(value);
-  const ms = Date.parse(String(value));
-  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+function kiwoomExpires(expiresDt) {
+  const s = String(expiresDt || "").replace(/\D/g, "");
+  if (s.length < 14) return Date.now() + 23 * 3600 * 1000;
+  const t = Date.parse(`${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T${s.slice(8, 10)}:${s.slice(10, 12)}:${s.slice(12, 14)}+09:00`);
+  return Number.isFinite(t) ? t : Date.now() + 23 * 3600 * 1000;
 }
 
-async function tossToken() {
-  if (!TOSS_CLIENT_ID || !TOSS_CLIENT_SECRET) return "";
-  if (tossAuth.token && Date.now() < tossAuth.exp - 60_000) return tossAuth.token;
-  const res = await fetch(`${TOSS_BASE}/oauth2/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
-    body: new URLSearchParams({
-      grant_type: "client_credentials",
-      client_id: TOSS_CLIENT_ID,
-      client_secret: TOSS_CLIENT_SECRET,
-    }),
+function etUnix(y, mo, d, hh, mi, ss) {
+  const utc = Date.UTC(y, mo - 1, d, hh, mi, ss);
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
   });
-  const data = unwrapToss(await res.json().catch(() => ({})));
-  const token = data.accessToken || data.access_token;
-  if (!res.ok || !token) {
-    throw new Error(data.error_description || data.message || `토스 토큰 실패 ${res.status}`);
+  const parts = (ms) => {
+    const o = {};
+    for (const p of fmt.formatToParts(new Date(ms))) {
+      if (p.type !== "literal") o[p.type] = Number(p.value);
+    }
+    return o;
+  };
+  let t = utc;
+  for (let i = 0; i < 3; i += 1) {
+    const got = parts(t);
+    t += utc - Date.UTC(got.year, got.month - 1, got.day, got.hour, got.minute, got.second);
   }
-  const ttl = Number(data.expiresIn || data.expires_in || 1800) * 1000;
-  tossAuth = { token, exp: Date.now() + ttl };
-  return token;
+  return Math.floor(t / 1000);
 }
 
-async function tossGet(pathname, params, retried = false) {
-  const token = await tossToken();
+function kiwoomBarTime(row) {
+  const raw = String(row?.cntr_tm || "");
+  const digits = raw.replace(/\D/g, "");
+  const bus = String(row?.bus_dt || "").replace(/\D/g, "");
+  let s = digits;
+  if (s.length === 6 && bus.length >= 8) s = bus.slice(0, 8) + s;
+  if (s.length < 12) return null;
+  return etUnix(
+    Number(s.slice(0, 4)),
+    Number(s.slice(4, 6)),
+    Number(s.slice(6, 8)),
+    Number(s.slice(8, 10)),
+    Number(s.slice(10, 12)),
+    s.length >= 14 ? Number(s.slice(12, 14)) : 0,
+  );
+}
+
+function kiwoomExchanges(hint) {
+  const text = String(hint || "").toUpperCase();
+  let first = "ND";
+  if (/AMEX|ASE|ARCA|NYSE AMERICAN|NYSE MKT/.test(text)) first = "NA";
+  else if (/\bNYSE\b|\bNYQ\b/.test(text)) first = "NY";
+  const rest = ["ND", "NY", "NA"].filter((x) => x !== first);
+  return [first, ...rest];
+}
+
+async function kiwoomToken() {
+  if (!KIWOOM_APP_KEY || !KIWOOM_SECRET_KEY) return "";
+  if (Date.now() < kiwoomAuthDownUntil) return kiwoomAuth.token || "";
+  if (kiwoomAuth.token && Date.now() < kiwoomAuth.exp - 60_000) return kiwoomAuth.token;
+  if (kiwoomTokenInflight) return kiwoomTokenInflight;
+  kiwoomTokenInflight = (async () => {
+    const res = await fetch(`${KIWOOM_BASE}/oauth2/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json;charset=UTF-8" },
+      body: JSON.stringify({
+        grant_type: "client_credentials",
+        appkey: KIWOOM_APP_KEY,
+        secretkey: KIWOOM_SECRET_KEY,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || (data.return_code != null && data.return_code !== 0) || !data.token) {
+      kiwoomAuthDownUntil = Date.now() + 30_000;
+      kiwoomDownMsg = data.return_msg || `키움 토큰 실패 ${res.status}`;
+      throw new Error(kiwoomDownMsg);
+    }
+    kiwoomAuth = { token: data.token, exp: kiwoomExpires(data.expires_dt) };
+    return kiwoomAuth.token;
+  })().finally(() => {
+    kiwoomTokenInflight = null;
+  });
+  return kiwoomTokenInflight;
+}
+
+async function kiwoomPost(path, apiId, body, retried = false) {
+  if (Date.now() < kiwoomAuthDownUntil) {
+    throw new Error(kiwoomDownMsg || "키움 인증 대기");
+  }
+  const token = await kiwoomToken();
   if (!token) return null;
-  const url = new URL(pathname, TOSS_BASE);
-  for (const [key, value] of Object.entries(params || {})) {
-    if (value != null && value !== "") url.searchParams.set(key, String(value));
-  }
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+  const res = await fetch(`${KIWOOM_BASE}${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json;charset=UTF-8",
+      authorization: `Bearer ${token}`,
+      "api-id": apiId,
+      "cont-yn": "N",
+      "next-key": "",
+    },
+    body: JSON.stringify(body),
   });
-  if (res.status === 401 && !retried) {
-    tossAuth = { token: "", exp: 0 };
-    return tossGet(pathname, params, true);
+  const data = await res.json().catch(() => ({}));
+  if (data.return_code === 8005 && !retried) {
+    kiwoomAuth = { token: "", exp: 0 };
+    return kiwoomPost(path, apiId, body, true);
   }
-  const data = unwrapToss(await res.json().catch(() => ({})));
-  if (!res.ok) throw new Error(data.message || data.error_description || `토스 조회 실패 ${res.status}`);
+  if (data.return_code === 8005) {
+    kiwoomAuthDownUntil = Date.now() + 45_000;
+    kiwoomDownMsg = data.return_msg || "키움 토큰이 유효하지 않습니다";
+    throw new Error(kiwoomDownMsg);
+  }
+  if (!res.ok || (data.return_code != null && data.return_code !== 0)) {
+    throw new Error(data.return_msg || `키움 ${apiId} 실패 ${data.return_code ?? res.status}`);
+  }
   return data;
 }
 
-function mapTossCandle(row) {
-  const t = tossTs(row.timestamp);
-  const o = Number(row.openPrice);
-  const h = Number(row.highPrice);
-  const l = Number(row.lowPrice);
-  const c = Number(row.closePrice);
-  const v = Number(row.volume) || 0;
-  if (t == null || [o, h, l, c].some((x) => !Number.isFinite(x))) return null;
-  return { t, o, h, l, c, v };
+function etYyyymmdd(offsetDays = 0) {
+  const t = Date.now() + offsetDays * DAY_MS;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(t));
+  const o = {};
+  for (const p of parts) {
+    if (p.type !== "literal") o[p.type] = p.value;
+  }
+  return `${o.year}${o.month}${o.day}`;
 }
 
-async function tossMinuteBars(symbol) {
-  if (!TOSS_CLIENT_ID || !symbol) return [];
-  if (tossBarCache.symbol === symbol && Date.now() - tossBarCache.at < 15_000) {
-    return tossBarCache.bars;
+function rememberKiwoom(code, pack, barAt, quoteAt) {
+  kiwoomBarCache.set(code, { barAt, quoteAt, pack });
+  if (kiwoomBarCache.size > 40) kiwoomBarCache.delete(kiwoomBarCache.keys().next().value);
+}
+
+async function kiwoomSession(symbol, exchangeHint) {
+  if (!KIWOOM_APP_KEY || !symbol) return { bars: [], quote: null };
+  const now = Date.now();
+  if (now < kiwoomAuthDownUntil) {
+    const cached = kiwoomBarCache.get(String(symbol).toUpperCase().split(".")[0]);
+    if (cached?.pack) return cached.pack;
+    throw new Error(kiwoomDownMsg || "키움 인증 실패");
   }
-  const cutoff = Math.floor(Date.now() / 1000) - 24 * 3600;
-  const bars = [];
-  let before;
-  for (let page = 0; page < 8; page += 1) {
-    const data = await tossGet("/api/v1/candles", {
-      symbol,
-      interval: "1m",
-      count: 200,
-      before,
+  const code = String(symbol).toUpperCase().split(".")[0];
+  const cached = kiwoomBarCache.get(code);
+  const barsOk = cached && now - cached.barAt < 20_000 && cached.pack?.bars?.length;
+  const quoteOk = cached && now - cached.quoteAt < 2_000 && cached.pack?.quote;
+  if (barsOk && quoteOk) return cached.pack;
+
+  const preferred = kiwoomExCache.get(code);
+  const exchanges = preferred ? [preferred] : kiwoomExchanges(exchangeHint);
+  let lastError = null;
+
+  for (const stex_tp of exchanges) {
+    try {
+      const needBars = !barsOk && now >= kiwoomChartDownUntil;
+      let chartErr = null;
+      const [chart, quoteRow] = await Promise.all([
+        needBars
+          ? kiwoomPost("/api/us/chart", "usa06011", {
+            stex_tp,
+            stk_cd: code,
+            strt_dt: etYyyymmdd(0),
+            tic_scope: "1",
+            upd_stkpc_tp: "0",
+            exrt_appl_tp: "0",
+          }).catch((err) => {
+            chartErr = err;
+            return null;
+          })
+          : Promise.resolve(null),
+        quoteOk
+          ? Promise.resolve(null)
+          : kiwoomPost("/api/us/mrkcond", "usa20100", { stex_tp, stk_cd: code }),
+      ]);
+      if (chartErr) {
+        const cmsg = String(chartErr.message || "");
+        if (/1700|한도/.test(cmsg)) {
+          kiwoomChartDownUntil = now + 15_000;
+          kiwoomDownMsg = cmsg;
+        } else if (!/1903|종목 정보/.test(cmsg)) lastError = chartErr;
+      }
+      const bars = barsOk
+        ? cached.pack.bars
+        : kiwoomPerMinuteBars(chart?.result_list);
+      const quote = quoteOk ? cached.pack.quote : mapKiwoomQuote(quoteRow);
+      if (!bars.length && !quote) {
+        lastError = new Error(`${code} ${stex_tp} 시세 없음`);
+        continue;
+      }
+      kiwoomExCache.set(code, stex_tp);
+      const pack = {
+        bars: bars.length ? bars : (cached?.pack.bars || []),
+        quote: quote || cached?.pack.quote || null,
+        exchange: stex_tp,
+      };
+      rememberKiwoom(
+        code,
+        pack,
+        barsOk || !needBars ? (cached?.barAt || now) : now,
+        quoteOk ? cached.quoteAt : now,
+      );
+      return pack;
+    } catch (err) {
+      lastError = err;
+      const msg = String(err?.message || "");
+      if (/1700|한도/.test(msg)) {
+        kiwoomChartDownUntil = now + 15_000;
+        kiwoomDownMsg = msg;
+        if (cached?.pack) return cached.pack;
+        break;
+      }
+      if (/토큰|인증|유효하지|권한/.test(msg)) {
+        kiwoomAuthDownUntil = now + 20_000;
+        kiwoomDownMsg = msg;
+        if (cached?.pack) return cached.pack;
+        throw err;
+      }
+    }
+  }
+  if (cached?.pack) return cached.pack;
+  throw lastError || new Error(`${code} 키움 조회 실패`);
+}
+
+function mapKiwoomCandle(row) {
+  const t = kiwoomBarTime(row);
+  const o = signedNum(row.open_pric);
+  const h = signedNum(row.high_pric);
+  const l = signedNum(row.low_pric);
+  const c = signedNum(row.cur_prc);
+  const vBar = signedNum(row.trde_qty) || signedNum(row.cntr_qty);
+  const vAcc = signedNum(row.acc_trde_qty);
+  if (t == null || ![o, h, l, c].every((x) => x > 0)) return null;
+  return {
+    t: Math.floor(t / 60) * 60,
+    o,
+    h,
+    l,
+    c,
+    v: vBar || vAcc || 0,
+    vAcc: vAcc || 0,
+  };
+}
+
+function kiwoomPerMinuteBars(rows) {
+  const bars = [...(rows || [])].map(mapKiwoomCandle).filter(Boolean).sort((a, b) => a.t - b.t);
+  if (bars.length < 2) {
+    return bars.map(({ vAcc, ...bar }) => bar);
+  }
+  const positives = bars.map((b) => b.v).filter((v) => v > 0);
+  const accBars = bars.filter((b) => b.vAcc > 0).length;
+  const barVolHits = bars.filter((b) => b.v > 0 && b.vAcc > 0 && b.v !== b.vAcc).length;
+  if (accBars < 2 || barVolHits >= Math.min(3, positives.length)) {
+    return bars.map(({ vAcc, ...bar }) => bar);
+  }
+  let rising = 0;
+  for (let i = 1; i < positives.length; i += 1) {
+    if (positives[i] >= positives[i - 1]) rising += 1;
+  }
+  const last = positives.at(-1) || 0;
+  const first = positives[0] || 0;
+  const looksCumulative = positives.length >= 3
+    && last >= first * 3
+    && rising >= Math.max(1, positives.length - 1) * 0.75;
+  if (!looksCumulative) {
+    return bars.map(({ vAcc, ...bar }) => bar);
+  }
+  let prev = 0;
+  return bars.map((b) => {
+    const acc = b.vAcc || b.v || 0;
+    const v = acc >= prev ? acc - prev : acc;
+    prev = acc;
+    return { t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v };
+  });
+}
+
+function mapKiwoomQuote(row) {
+  if (!row) return null;
+  const last = signedNum(row.cur_prc);
+  if (!(last > 0)) return null;
+  const volume = signedNum(row.acc_trde_qty) || null;
+  const turnover = signedNum(row.trde_prica) || signedNum(row.acc_trde_prica) || null;
+  return {
+    last,
+    volume,
+    turnover: turnover || null,
+    bid: signedNum(row.buy_bid1 || row.bid_uv || row.buy_uv) || null,
+    ask: signedNum(row.sel_bid1 || row.ask_uv || row.sel_uv) || null,
+  };
+}
+
+let kiwoomRankCache = { at: 0, rows: [], basis: "" };
+const quoteTape = new Map();
+const liveBoard = new Map();
+const rthCloseBySym = new Map();
+let liveKickBusy = false;
+let boardEtDay = "";
+
+function etDateKey(d = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(d);
+}
+
+function rememberRthClose(symbol, px) {
+  const code = String(symbol || "").toUpperCase().split(".")[0];
+  if (!code || !(px > 0)) return;
+  rthCloseBySym.set(code, px);
+  if (rthCloseBySym.size > 400) rthCloseBySym.delete(rthCloseBySym.keys().next().value);
+}
+
+function resetUsBoardIfNewEtDay() {
+  const day = etDateKey();
+  if (!boardEtDay) {
+    boardEtDay = day;
+    return false;
+  }
+  if (day === boardEtDay) return false;
+  boardEtDay = day;
+  kiwoomRankCache = { at: 0, rows: [], basis: "" };
+  minuteCache = { at: 0, rows: [] };
+  liveBoard.clear();
+  quoteTape.clear();
+  rthCloseBySym.clear();
+  return true;
+}
+
+function pctFromClose(price, close) {
+  if (!(close > 0) || !(price > 0)) return null;
+  return Number((((price - close) / close) * 100).toFixed(2));
+}
+
+async function kiwoomQuoteOnly(symbol, exchangeHint) {
+  if (!KIWOOM_APP_KEY || !symbol) return null;
+  if (Date.now() < kiwoomAuthDownUntil) return liveBoard.get(String(symbol).toUpperCase())?.quote || null;
+  const code = String(symbol).toUpperCase().split(".")[0];
+  const hit = liveBoard.get(code);
+  if (hit?.quote && Date.now() - (hit.kwAt || 0) < 1000) return hit.quote;
+  const stex_tp = kiwoomExCache.get(code) || kiwoomExchanges(exchangeHint)[0];
+  try {
+    const row = await kiwoomPost("/api/us/mrkcond", "usa20100", { stex_tp, stk_cd: code });
+    const quote = mapKiwoomQuote(row);
+    if (quote) kiwoomExCache.set(code, stex_tp);
+    return quote;
+  } catch {
+    return hit?.quote || null;
+  }
+}
+
+function sessionVolumeStats(volume, avgVol) {
+  if (!(avgVol > 0) || volume == null || !Number.isFinite(Number(volume))) {
+    return { volSurgePct: null, volDelta: null, relVol: null };
+  }
+  const vol = Number(volume);
+  const avg = Number(avgVol);
+  return {
+    volSurgePct: Number((((vol - avg) / avg) * 100).toFixed(2)),
+    volDelta: Math.round(vol - avg),
+    relVol: Number((vol / avg).toFixed(2)),
+  };
+}
+
+function rememberLiveBoard(symbol, patch) {
+  const code = String(symbol || "").toUpperCase();
+  if (!code) return;
+  const cur = liveBoard.get(code) || {};
+  liveBoard.set(code, { ...cur, ...patch, at: Date.now() });
+  if (liveBoard.size > 80) liveBoard.delete(liveBoard.keys().next().value);
+}
+
+function overlayLiveBoard(rows) {
+  const session = tapeSessionNow();
+  return rows.map((row) => {
+    const live = liveBoard.get(row.symbol);
+    const price = live?.price || row.price;
+    const volume = live?.kwAt && live.volume > 0 ? live.volume : (live?.volume || row.volume);
+    const turnover = price > 0 && volume > 0
+      ? price * volume
+      : (live?.turnover || row.turnover || null);
+    const avgVol = row.avgVol || live?.avgVol || null;
+    const stats = sessionVolumeStats(volume, avgVol);
+    const fromKiwoom = row.volSurgePct != null || row.source === "volume" || row.source === "surge";
+    const rthClose = live?.rthClose || rthCloseBySym.get(row.symbol);
+    let dayChangePct = row.dayChangePct ?? row.changePct ?? null;
+    if (session === "POST" || (session === "CLOSED" && rthClose > 0)) {
+      dayChangePct = pctFromClose(price, rthClose) ?? live?.postChangePct ?? 0;
+    }
+    return {
+      ...row,
+      price,
+      volume,
+      turnover,
+      avgVol: fromKiwoom ? row.avgVol : avgVol,
+      volSurgePct: row.volSurgePct ?? stats.volSurgePct,
+      volDelta: row.volDelta ?? (fromKiwoom ? null : stats.volDelta),
+      relVol: row.relVol ?? (fromKiwoom ? row.relVol : stats.relVol),
+      dayChangePct,
+      changePct: dayChangePct,
+    };
+  });
+}
+
+async function applyYahooLive(rows) {
+  const session = tapeSessionNow();
+  const quotes = await yahooQuotesBatch(rows.slice(0, 40).map((r) => r.symbol));
+  for (const row of rows) {
+    const q = quotes.get(row.symbol);
+    if (!q) continue;
+    const prev = liveBoard.get(row.symbol) || {};
+    if (session === "REGULAR" && q.last > 0) rememberRthClose(row.symbol, q.last);
+    if ((session === "POST" || session === "CLOSED") && q.regularMarketPrice > 0) {
+      rememberRthClose(row.symbol, q.regularMarketPrice);
+    }
+    rememberLiveBoard(row.symbol, {
+      price: q.last || prev.price,
+      avgVol: q.avgVol || prev.avgVol,
+      rthClose: rthCloseBySym.get(row.symbol) || q.regularMarketPrice || prev.rthClose,
+      postChangePct: q.postMarketChangePercent,
+      ...(q.volume > 0 && !prev.kwAt ? { volume: q.volume } : {}),
     });
-    const rows = (data?.candles || []).map(mapTossCandle).filter(Boolean);
-    if (!rows.length) break;
-    bars.push(...rows);
-    const oldest = rows.at(-1)?.t ?? rows[0]?.t;
-    before = data?.nextBefore;
-    if (!before || oldest <= cutoff) break;
   }
-  const uniq = new Map();
-  for (const bar of bars) uniq.set(Math.floor(bar.t / 60) * 60, { ...bar, t: Math.floor(bar.t / 60) * 60 });
-  const out = [...uniq.values()].sort((a, b) => a.t - b.t);
-  tossBarCache = { symbol, at: Date.now(), bars: out };
-  return out;
 }
 
-function blendMinuteBars(yahooBars, tossBars) {
+function kickKiwoomLive(rows) {
+  if (liveKickBusy || !KIWOOM_APP_KEY || Date.now() < kiwoomAuthDownUntil) return;
+  const now = Date.now();
+  const need = rows.filter((r) => now - (liveBoard.get(r.symbol)?.kwAt || 0) > 1200).slice(0, 6);
+  if (!need.length) return;
+  liveKickBusy = true;
+  mapLimit(need, 3, async (row) => {
+    try {
+      const q = await kiwoomQuoteOnly(row.symbol, row.exchange);
+      if (!q) return;
+      const prev = liveBoard.get(row.symbol) || {};
+      const price = q.last || prev.price || row.price;
+      const volume = q.volume || prev.volume || row.volume;
+      const turnover = q.turnover || prev.turnover;
+      if (tapeSessionNow() === "REGULAR" && price > 0) rememberRthClose(row.symbol, price);
+      rememberLiveBoard(row.symbol, {
+        price,
+        volume,
+        turnover,
+        quote: q,
+        kwAt: Date.now(),
+        rthClose: rthCloseBySym.get(row.symbol) || prev.rthClose,
+      });
+    } catch {}
+  }).finally(() => {
+    liveKickBusy = false;
+  });
+}
+
+async function liveBoardRows(rows) {
+  if (!rows?.length) return rows;
+  await applyYahooLive(rows).catch(() => {});
+  kickKiwoomLive(rows);
+  return overlayLiveBoard(rows);
+}
+
+function kiwoomMinuteTape(symbol, quoteVol, barTs) {
+  if (!(quoteVol > 0) || !symbol) return 0;
+  const minute = Math.floor(barTs / 60) * 60;
+  const code = String(symbol).toUpperCase().split(".")[0];
+  const cur = quoteTape.get(code);
+  if (!cur) {
+    quoteTape.set(code, { minute, last: quoteVol, acc: 0, byMin: new Map() });
+    return 0;
+  }
+  if (cur.minute !== minute) {
+    if (cur.acc > 0) cur.byMin.set(cur.minute, cur.acc);
+    const add = Math.max(0, quoteVol - cur.last);
+    cur.minute = minute;
+    cur.last = quoteVol;
+    cur.acc = add;
+    if (add > 0) cur.byMin.set(minute, add);
+    return add;
+  }
+  const add = Math.max(0, quoteVol - cur.last);
+  cur.last = quoteVol;
+  cur.acc += add;
+  cur.byMin.set(minute, cur.acc);
+  return cur.acc;
+}
+
+function applyTapeHistory(bars, symbol) {
+  const code = String(symbol || "").toUpperCase().split(".")[0];
+  const taped = quoteTape.get(code)?.byMin;
+  if (!taped?.size) return bars;
+  return bars.map((b) => {
+    const extra = taped.get(Math.floor(b.t / 60) * 60) || 0;
+    return extra > 0 ? { ...b, v: Math.max(b.v || 0, extra) } : b;
+  });
+}
+
+function allocateSessionVolume(bars, sessionVol) {
+  if (!(sessionVol > 0) || !bars?.length) return bars;
+  const known = bars.reduce((s, b) => s + (b.v || 0), 0);
+  if (known >= sessionVol * 0.15) return bars;
+  const weights = bars.map((b) => {
+    if (b.flat) return 0;
+    const range = Math.max(b.h - b.l, Math.abs(b.c - b.o));
+    return range > 0 ? range : 0;
+  });
+  const sum = weights.reduce((a, b) => a + b, 0);
+  if (!(sum > 0)) {
+    const live = bars.filter((b) => !b.flat);
+    const pool = live.length ? live : bars.slice(-30);
+    const each = Math.max(1, Math.round(sessionVol / Math.max(pool.length, 1)));
+    const times = new Set(pool.map((b) => b.t));
+    return bars.map((b) => (times.has(b.t) ? { ...b, v: Math.max(b.v || 0, each) } : b));
+  }
+  return bars.map((b, i) => {
+    if (!weights[i]) return b;
+    return { ...b, v: Math.max(b.v || 0, Math.round(sessionVol * (weights[i] / sum))) };
+  });
+}
+
+function rankExchange(tp) {
+  const v = String(tp || "").toUpperCase();
+  if (v === "1" || v === "NY") return "NYSE";
+  if (v === "2" || v === "ND") return "NASDAQ";
+  if (v === "3" || v === "NA") return "AMEX";
+  return "US";
+}
+
+function mapKiwoomRankRow(row, kind) {
+  const symbol = String(row?.stk_cd || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (!symbol) return null;
+  const price = signedNum(row.cur_prc);
+  const changePct = signedNum(row.flu_rt);
+  const volume = signedNum(row.now_trde_qty) || signedNum(row.acc_trde_qty);
+  const prevVol = signedNum(row.prev_trde_qty);
+  const surge = signedNum(row.sdnin_rt) || signedNum(row.pred_rt);
+  const volSurgePct = Number.isFinite(surge)
+    ? surge
+    : (prevVol && volume ? ((volume - prevVol) / prevVol) * 100 : NaN);
+  let volDelta = signedNum(row.sdnin_qty) || (volume && prevVol ? volume - prevVol : 0);
+  if (!volDelta && volume > 0 && Number.isFinite(volSurgePct) && volSurgePct !== -100) {
+    volDelta = Math.round(volume - volume / (1 + volSurgePct / 100));
+  }
+  const turnover = signedNum(row.trde_prica) || (price && volume ? price * volume : 0);
+  const relVol = prevVol && volume ? volume / prevVol : (volSurgePct ? 1 + volSurgePct / 100 : null);
+  return {
+    symbol,
+    name: row.stk_nm || row.stk_enm || symbol,
+    exchange: rankExchange(row.stex_tp),
+    price: price || null,
+    change: signedNum(row.pred_pre) || null,
+    dayChangePct: Number.isFinite(changePct) ? changePct : null,
+    minuteChangePct: null,
+    changePct: Number.isFinite(changePct) ? changePct : null,
+    volume: volume || null,
+    turnover: turnover || null,
+    avgVol: prevVol || null,
+    volDelta: Number.isFinite(volDelta) ? volDelta : null,
+    volSurgePct: Number.isFinite(volSurgePct) ? Number(volSurgePct.toFixed(2)) : null,
+    relVol: relVol != null ? Number(relVol.toFixed(2)) : null,
+    minuteRelVol: null,
+    heat: null,
+    source: kind,
+    kiwoomRank: null,
+  };
+}
+
+async function kiwoomRankList(apiId, body) {
+  const data = await kiwoomPost("/api/us/rkinfo", apiId, body);
+  const list = data?.result_list || data?.trde_qty_sdnin || [];
+  return Array.isArray(list) ? list : [];
+}
+
+const KIWOOM_RANK_BODY = {
+  stex_tp: "0",
+  inds_cd: "",
+  stk_tp: "0",
+  trde_qty_tp: "0",
+  qry_tp: "0",
+  stk_cnd: "0",
+  pric_cnd: "0",
+  trde_prica_cnd: "0",
+};
+
+async function kiwoomVolumeBoard() {
+  if (!KIWOOM_APP_KEY) return { at: 0, rows: [], basis: "" };
+  if (Date.now() < kiwoomAuthDownUntil) {
+    return kiwoomRankCache.rows.length ? kiwoomRankCache : { at: 0, rows: [], basis: "" };
+  }
+  if (Date.now() - kiwoomRankCache.at < 25_000 && kiwoomRankCache.rows.length) {
+    return kiwoomRankCache;
+  }
+  const [volRows, valueRows] = await Promise.all([
+    kiwoomRankList("usa20530", KIWOOM_RANK_BODY).catch((err) => {
+      console.warn("kiwoom usa20530:", err.message);
+      return [];
+    }),
+    kiwoomRankList("usa20540", { ...KIWOOM_RANK_BODY, qry_tp: "1" }).catch((err) => {
+      console.warn("kiwoom usa20540:", err.message);
+      return [];
+    }),
+  ]);
+  const bySym = new Map();
+  let rank = 0;
+  for (const row of volRows.map((r) => mapKiwoomRankRow(r, "volume")).filter(Boolean)) {
+    bySym.set(row.symbol, { ...row, kiwoomRank: rank });
+    rank += 1;
+  }
+  for (const row of valueRows.map((r) => mapKiwoomRankRow(r, "surge")).filter(Boolean)) {
+    const cur = bySym.get(row.symbol);
+    bySym.set(row.symbol, cur
+      ? {
+        ...cur,
+        turnover: row.turnover || cur.turnover,
+        volSurgePct: cur.volSurgePct || row.volSurgePct,
+        volume: cur.volume || row.volume,
+      }
+      : { ...row, kiwoomRank: rank++ });
+  }
+  const rows = [...bySym.values()].filter((r) => isGainerName(r) || r.source === "surge" || r.source === "volume");
+  rows.sort((a, b) => (a.kiwoomRank ?? 9999) - (b.kiwoomRank ?? 9999) || (b.volSurgePct ?? -1) - (a.volSurgePct ?? -1));
+  const pack = {
+    at: Date.now(),
+    rows,
+    basis: volRows.length ? "kiwoom-volume" : (valueRows.length ? "kiwoom-turnover" : ""),
+  };
+  if (rows.length) kiwoomRankCache = pack;
+  return pack;
+}
+
+function blendMinuteBars(yahooBars, extraBars) {
   const byMin = new Map();
   for (const bar of yahooBars || []) byMin.set(Math.floor(bar.t / 60) * 60, { ...bar });
-  for (const bar of tossBars || []) {
+  for (const bar of extraBars || []) {
     const t = Math.floor(bar.t / 60) * 60;
     const cur = byMin.get(t);
     if (!cur) {
@@ -597,15 +1148,46 @@ function packQuote(p) {
     ask: rawNum(p.ask),
     bidSize: rawNum(p.bidSize),
     askSize: rawNum(p.askSize),
+    avgVol: rawNum(p.averageDailyVolume3Month) || rawNum(p.averageDailyVolume10Day),
     volume: pre
-      ? (p.preMarketVolume > 0 ? rawNum(p.preMarketVolume) : null)
+      ? (rawNum(p.preMarketVolume) || rawNum(p.regularMarketVolume))
       : post
-        ? (p.postMarketVolume > 0 ? rawNum(p.postMarketVolume) : null)
+        ? (rawNum(p.postMarketVolume) || rawNum(p.regularMarketVolume))
         : rawNum(p.regularMarketVolume),
     marketState: state,
     preMarketPrice: rawNum(p.preMarketPrice),
     postMarketPrice: rawNum(p.postMarketPrice),
+    regularMarketPrice: rawNum(p.regularMarketPrice ?? p.last),
+    postMarketChangePercent: rawNum(p.postMarketChangePercent),
+    preMarketChangePercent: rawNum(p.preMarketChangePercent),
   };
+}
+
+async function yahooQuotesBatch(symbols) {
+  const list = [...new Set((symbols || []).map((s) => String(s || "").toUpperCase()).filter(Boolean))].slice(0, 40);
+  if (!list.length) return new Map();
+  const tryOnce = async () => {
+    const data = await yahooJson(
+      `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(list.join(","))}`,
+    );
+    const out = new Map();
+    for (const row of data.quoteResponse?.result || []) {
+      const packed = packQuote(row);
+      const symbol = String(row.symbol || "").toUpperCase();
+      if (packed && symbol) out.set(symbol, packed);
+    }
+    return out;
+  };
+  try {
+    return await tryOnce();
+  } catch {
+    yahooAuth = { cookie: "", crumb: "", at: 0 };
+    try {
+      return await tryOnce();
+    } catch {
+      return new Map();
+    }
+  }
 }
 
 async function yahooQuote(symbol) {
@@ -952,20 +1534,40 @@ function barSession(t, preStart, start, end, kr) {
   return "other";
 }
 
+function rthCloseFromChart(chart) {
+  const close = barsFromChart(chart).filter((b) => barSession(b.t) === "rth").at(-1)?.c;
+  return close > 0 ? close : null;
+}
+
+function currentUsTapeStart(end) {
+  const mins = nyMinutes(end);
+  if (mins >= 4 * 60 && mins < 20 * 60) {
+    return end - (mins - 4 * 60) * 60;
+  }
+  return end - 6 * 3600;
+}
+
 function fillMinuteGrid(bars, now) {
   const end = Math.floor(now / 60) * 60;
-  const startTs = end - 24 * 3600;
+  const sessionFrom = currentUsTapeStart(end);
   const byMin = new Map();
   let seed = null;
-  for (const b of bars) {
+  for (const b of bars || []) {
     const t = Math.floor(b.t / 60) * 60;
-    if (t < startTs) seed = b.c;
-    if (t >= startTs && t <= end) byMin.set(t, { ...b, t });
+    if (t < sessionFrom) seed = b.c;
+    if (t >= sessionFrom && t <= end) byMin.set(t, { ...b, t });
   }
-  if (seed == null && bars[0]) seed = bars[0].c;
+  const real = [...byMin.values()]
+    .filter((b) => !b.flat && (b.v > 0 || b.h !== b.l || b.o !== b.c))
+    .sort((a, b) => a.t - b.t);
+  const from = Math.max(
+    sessionFrom,
+    Math.min(real[0]?.t ?? sessionFrom, end - 45 * 60),
+  );
+  if (seed == null) seed = (byMin.get(from) || real[0] || bars?.[0])?.c;
   const out = [];
   let px = seed;
-  for (let t = startTs; t <= end; t += 60) {
+  for (let t = from; t <= end; t += 60) {
     const hit = byMin.get(t);
     if (hit) {
       out.push(hit);
@@ -977,10 +1579,10 @@ function fillMinuteGrid(bars, now) {
   return out.length ? out : bars;
 }
 
-function buildIntraday(chart1m, chart1d, quote, tossBars) {
+function buildIntraday(chart1m, chart1d, quote, extraBars) {
   if (!chart1m) return null;
   const meta = chart1m.meta || {};
-  const bars = blendMinuteBars(barsFromChart(chart1m), tossBars);
+  const bars = blendMinuteBars(barsFromChart(chart1m), extraBars);
   const start = sessionStart(chart1m);
   const end = meta.currentTradingPeriod?.regular?.end
     || meta.regularMarketTime
@@ -1016,14 +1618,15 @@ function buildIntraday(chart1m, chart1d, quote, tossBars) {
   const state = String(quote?.marketState || meta.marketState || "").toUpperCase();
   const inPost = /POST/.test(state);
   const inPreState = /PRE/.test(state) && !inPost;
-  const quoteVol = inPreState || inPost
-    ? rawNum(quote?.volume)
-    : rawNum(quote?.volume ?? meta.regularMarketVolume);
+  const quoteVol = rawNum(quote?.volume) || rawNum(meta.regularMarketVolume) || rawNum(meta.preMarketVolume);
   const liveTape = /REGULAR/.test(state) || inPreState;
-  const tossTape = (tossBars || []).some((b) => b.v > 0);
-  if (!tossTape && liveTape && quoteVol != null && quoteVol > 0) {
-    const forming = quoteVol - completedVol;
-    if (forming >= 0) last.v = Math.max(last.v, forming);
+  const sessionFrom = sessionOpen || use[0].t;
+  const sessionTo = inPre && start ? start : (end || last.t + 60);
+  const extraLive = (extraBars || []).filter((b) => b.t >= sessionFrom && b.t < sessionTo && b.v > 0);
+  const brokerLive = extraLive.some((b) => last.t - b.t <= 180);
+  const tapeMin = kiwoomMinuteTape(meta.symbol, quoteVol, last.t);
+  if (!brokerLive && liveTape && tapeMin > 0) {
+    last.v = Math.max(last.v, tapeMin);
   }
   const volume = quoteVol != null && quoteVol > 0 ? quoteVol : (completedVol + last.v);
   const volBar = liveTape ? last : ([...use].reverse().find((b) => b.v > 0) || last);
@@ -1035,13 +1638,27 @@ function buildIntraday(chart1m, chart1d, quote, tossBars) {
   const orl = Math.min(...orPool.map((b) => b.l));
   const pv = use.reduce((s, b) => s + ((b.h + b.l + b.c) / 3) * b.v, 0);
   const vwap = volume ? pv / volume : price;
-  const closes = use.map((b) => b.c);
+  const oscFrom = preStart || sessionOpen || use[0].t;
+  let oscUse = bars.filter((b) => b.t >= oscFrom && b.c != null);
+  if (oscUse.length < 26) oscUse = bars.filter((b) => b.c != null);
+  if (oscUse.length < 15) oscUse = use;
+  oscUse = applyLiveQuote(oscUse, {
+    ...meta,
+    marketState: quote?.marketState || meta.marketState,
+    preMarketPrice: quote?.preMarketPrice ?? meta.preMarketPrice,
+    postMarketPrice: quote?.postMarketPrice ?? meta.postMarketPrice,
+    regularMarketPrice: quote?.last ?? meta.regularMarketPrice,
+  });
+  const closes = oscUse.map((b) => b.c);
   const ema9 = emaSeries(closes, 9).at(-1);
   const ema21 = emaSeries(closes, 21).at(-1);
   const rsi = rsiValue(closes, 14);
-  const atr = atrValue(use, 14);
+  const rsiPrev = rsiValue(closes.slice(0, -1), 14);
+  const atr = atrValue(oscUse, 14);
   const macd = macdValue(closes);
-  const stoch = stochK(use, 14);
+  const macdPrev = macdValue(closes.slice(0, -1));
+  const stoch = stochK(oscUse, 14);
+  const stochPrev = oscUse.length > 15 ? stochK(oscUse.slice(0, -1), 14) : null;
   const lookback = use.slice(-21, -1);
   const avg1mVol = lookback.length
     ? lookback.reduce((s, b) => s + b.v, 0) / lookback.length
@@ -1073,6 +1690,10 @@ function buildIntraday(chart1m, chart1d, quote, tossBars) {
   let chartBars = fillMinuteGrid(bars, now);
   if (!chartBars.length) chartBars = use;
   else chartBars = applyLiveQuote(chartBars, liveMeta);
+  chartBars = applyTapeHistory(chartBars, meta.symbol);
+  const chartLast = chartBars.at(-1);
+  if (chartLast && last?.v > 0) chartLast.v = Math.max(chartLast.v || 0, last.v);
+  chartBars = allocateSessionVolume(chartBars, quoteVol || volume);
   const packBar = (b) => ({
     time: b.t,
     open: b.o,
@@ -1105,13 +1726,16 @@ function buildIntraday(chart1m, chart1d, quote, tossBars) {
     relVol,
     volSpike,
     rsi,
+    rsiPrev,
     ema9,
     ema21,
     atr,
     macd: macd.macd,
     macdSignal: macd.signal,
     macdHist: macd.hist,
+    macdHistPrev: macdPrev.hist,
     stoch,
+    stochPrev,
     change: price - prev,
     changePct: prev ? ((price - prev) / prev) * 100 : 0,
     gapPct: prev ? ((open - prev) / prev) * 100 : 0,
@@ -1130,11 +1754,13 @@ function roundPx(n) {
   if (n == null || Number.isNaN(n)) return null;
   if (n >= 100) return Math.round(n * 100) / 100;
   if (n >= 10) return Math.round(n * 1000) / 1000;
-  return Math.round(n * 10000) / 10000;
+  if (n >= 1) return Math.round(n * 10000) / 10000;
+  return Math.round(n * 1e6) / 1e6;
 }
 
 function minRisk(buy) {
-  return Math.max(buy * 0.0025, 0.01);
+  if (!(buy > 0)) return 0.01;
+  return Math.max(buy * 0.0025, buy >= 1 ? 0.01 : buy * 0.01);
 }
 
 function fmtAmt(n) {
@@ -1145,43 +1771,119 @@ function fmtAmt(n) {
   return String(Math.round(n));
 }
 
+function lookbackRange(candles, n) {
+  const slice = (candles || []).slice(-Math.max(n, 2));
+  if (slice.length < 2) return null;
+  let hi = -Infinity;
+  let lo = Infinity;
+  for (const c of slice) {
+    if (c.high > hi) hi = c.high;
+    if (c.low < lo) lo = c.low;
+  }
+  return Number.isFinite(hi) && Number.isFinite(lo) && hi > lo ? hi - lo : null;
+}
+
+function horizonMove(intraday, fill, minutes) {
+  const atr = Number(intraday?.atr) || fill * 0.006;
+  const range = lookbackRange(intraday?.candles, minutes);
+  const atrPct = fill ? atr / fill : 0.006;
+  const fromAtr = atr * Math.sqrt(minutes) * 1.15;
+  const fromRange = range != null ? range * (minutes === 5 ? 0.5 : 0.4) : 0;
+  const floor = fill * (minutes === 5 ? Math.max(0.008, atrPct * 1.1) : Math.max(0.014, atrPct * 1.7));
+  const cap = fill * (minutes === 5 ? 0.04 : 0.06);
+  return Math.min(cap, Math.max(floor, fromAtr, fromRange));
+}
+
+function clampRisk(fill, raw, t5) {
+  const lo = fill * 0.008;
+  const hi = Math.min(fill * 0.028, t5 != null ? Math.max(t5 * 1.2, lo) : fill * 0.028);
+  return Math.min(hi, Math.max(lo, raw || lo));
+}
+
 function computeLiveStop(intraday, buyPrice) {
   const px = buyPrice ?? intraday.exec?.price ?? intraday.price;
   if (px == null) return { price: null, reason: "" };
   const atr = intraday.atr || px * 0.003;
-  const risk = Math.max(minRisk(px), atr * 0.7);
+  const t5 = horizonMove(intraday, px, 5);
+  const risk = clampRisk(px, Math.max(minRisk(px), atr * 1.4), t5);
   const price = roundPx(px - risk);
-  return { price, reason: `실시간 손절 ${price} (체결가 − 0.7 ATR)` };
+  return { price, reason: `실시간 손절 ${price} (약 ${((risk / px) * 100).toFixed(1)}% · 5~10분 단타)` };
 }
 
 function tacticLevels(intraday, fill, tactic) {
   const atr = intraday.atr || fill * 0.003;
-  const scalp = Math.max(minRisk(fill), atr * 0.7);
+  const t5 = horizonMove(intraday, fill, 5);
+  const t10 = Math.max(t5 * 1.35, horizonMove(intraday, fill, 10));
+  const scalp = clampRisk(fill, Math.max(minRisk(fill), atr * 1.4), t5);
   let stop = roundPx(fill - scalp);
-  let stopWhy = `단타 손절 ${stop} (0.7 ATR)`;
+  let stopWhy = `5~10분 손절 ${stop} (${((scalp / fill) * 100).toFixed(1)}%)`;
   if (tactic === "orb" && intraday.orh != null) {
-    stop = roundPx(Math.min(fill - scalp, intraday.orh - atr * 0.12));
+    stop = roundPx(Math.min(fill - scalp, Math.max(intraday.orh - atr * 0.12, fill - t5)));
     stopWhy = `ORB/PMH 실패 손절 ${stop}`;
-  } else if (tactic === "vwap" && intraday.vwap != null) {
-    stop = roundPx(Math.min(intraday.vwap - atr * 0.12, fill - scalp));
-    stopWhy = `VWAP 이탈 손절 ${stop}`;
+  } else if (tactic === "chase") {
+    const floor = intraday.orh != null ? intraday.orh - atr * 0.2 : fill - t5;
+    stop = roundPx(Math.min(fill - scalp, Math.max(floor, fill - t5 * 1.15)));
+    stopWhy = `과열 추적 실패 손절 ${stop}`;
+  } else if ((tactic === "vwap" || tactic === "bounce") && intraday.vwap != null) {
+    stop = roundPx(Math.min(Math.max(intraday.vwap - atr * 0.12, fill - t5 * 1.1), fill - scalp));
+    stopWhy = tactic === "bounce" ? `반등 실패 손절 ${stop}` : `VWAP 이탈 손절 ${stop}`;
   } else if (tactic === "pullback") {
-    const floor = intraday.ema21 != null ? intraday.ema21 : fill - scalp;
-    stop = roundPx(Math.min(floor, fill - scalp));
-    stopWhy = `EMA 눌림 실패 손절 ${stop}`;
+    const levels = [intraday.ema9, intraday.ema21, intraday.vwap, intraday.orh].filter((n) => n != null);
+    const floor = levels.length ? Math.min(...levels) - atr * 0.2 : fill - scalp;
+    stop = roundPx(Math.min(Math.max(floor, fill - t5 * 1.15), fill - scalp));
+    stopWhy = `눌림목 실패 손절 ${stop}`;
   }
   if (stop == null || stop >= fill) {
     stop = roundPx(fill - scalp);
-    stopWhy = `단타 손절 ${stop} (0.7 ATR)`;
+    stopWhy = `5~10분 손절 ${stop} (${((scalp / fill) * 100).toFixed(1)}%)`;
   }
-  const target = roundPx(fill + (fill - stop));
-  return { stopPrice: stop, stopWhy, sellBase: target };
+  const risk = fill - stop;
+  if (risk > fill * 0.028) {
+    stop = roundPx(fill * 0.972);
+    stopWhy = `${stopWhy} · 최대 2.8%`;
+  } else if (risk < fill * 0.008) {
+    stop = roundPx(fill * 0.992);
+    stopWhy = `${stopWhy} · 최소 0.8%`;
+  }
+  return {
+    stopPrice: stop,
+    stopWhy,
+    sellBase: roundPx(fill + t5),
+    stretch: roundPx(fill + t10),
+  };
+}
+
+function runnerProfile(intraday) {
+  const px = Number(intraday?.price);
+  const atr = Number(intraday?.atr) || (Number.isFinite(px) ? px * 0.006 : 0);
+  const atrPct = px ? (atr / px) * 100 : 0;
+  const high = Number(intraday?.high);
+  const low = Number(intraday?.low);
+  const rangePct = px && Number.isFinite(high) && Number.isFinite(low) ? ((high - low) / px) * 100 : 0;
+  const impulse = Math.max(
+    Math.abs(Number(intraday?.fromOpenPct) || 0),
+    Math.abs(Number(intraday?.gapPct) || 0),
+    Math.abs(Number(intraday?.changePct) || 0),
+    rangePct,
+  );
+  const hotTape = (intraday?.volSpike != null && intraday.volSpike >= 1.5)
+    || (intraday?.relVol != null && intraday.relVol >= 1.4);
+  const megaQuiet = Number.isFinite(px) && px >= 80 && atrPct < 0.45 && impulse < 2.2;
+  const mover = atrPct >= 0.4 || rangePct >= 2.2 || impulse >= 2.5 || (hotTape && impulse >= 1);
+  return {
+    ok: !megaQuiet && mover,
+    atrPct,
+    rangePct,
+    impulse,
+    hotTape,
+  };
 }
 
 function pickDayTactic(intraday, bias) {
   const px = intraday.price;
   const rsi = intraday.rsi;
-  const atr = intraday.atr || px * 0.003;
+  const stoch = intraday.stoch;
+  const atr = intraday.atr || px * 0.006;
   const vwap = intraday.vwap;
   const ema9 = intraday.ema9;
   const ema21 = intraday.ema21;
@@ -1192,25 +1894,57 @@ function pickDayTactic(intraday, bias) {
   const candles = intraday.candles || [];
   const last = candles.at(-1);
   const prev = candles.at(-2);
+  const runner = runnerProfile(intraday);
   const aboveVwap = vwap != null && px >= vwap;
+  const vsVwapPct = vwap ? ((px - vwap) / vwap) * 100 : 0;
   const trend = ema9 != null && ema21 != null && ema9 >= ema21;
-  const macdUp = intraday.macdHist == null || intraday.macdHist >= 0;
-  const notChase = preMode
-    ? !((rsi != null && rsi >= 82) || (intraday.gapPct >= 15 && rsi != null && rsi >= 70) || (intraday.fromOpenPct >= 10 && rsi != null && rsi >= 72))
-    : !((rsi != null && rsi >= 78) || (intraday.fromOpenPct >= 6 && rsi != null && rsi >= 70));
+  const macdUp = intraday.macdHist != null && intraday.macdHist >= 0;
+  const macdAccel = intraday.macdHistPrev == null || (intraday.macdHist != null && intraday.macdHist > intraday.macdHistPrev);
+  const rsiBuy = rsi == null || (rsi >= 40 && rsi <= 82);
+  const rsiHot = rsi == null || (rsi >= 40 && rsi <= 92);
+  const rsiTurn = rsi == null || intraday.rsiPrev == null || rsi > intraday.rsiPrev;
+  const stochBuy = stoch == null || (stoch >= 20 && stoch <= 88);
+  const stochTurn = stoch == null || intraday.stochPrev == null || stoch > intraday.stochPrev;
+  const overheated = (rsi != null && rsi >= 75) || (stoch != null && stoch >= 82)
+    || vsVwapPct >= 6 || (preMode ? (intraday.fromOpenPct >= 12 || intraday.gapPct >= 18) : intraday.fromOpenPct >= 8);
   const volAlive = preMode
-    ? (intraday.volSpike == null || intraday.volSpike >= 1)
-    : (intraday.relVol == null || intraday.relVol >= 0.7) && (intraday.volSpike == null || intraday.volSpike >= 0.75);
+    ? (intraday.volSpike != null && intraday.volSpike >= 1.4) || runner.hotTape
+    : ((intraday.volSpike != null && intraday.volSpike >= 1.2) || (intraday.relVol != null && intraday.relVol >= 1.3));
+  const volExpand = Boolean(last && prev && (last.volume || 0) >= (prev.volume || 0) * 0.85);
+  const chaseVol = volAlive && volExpand && (
+    preMode
+      ? (intraday.volSpike != null && intraday.volSpike >= 1.8) || runner.hotTape
+      : (intraday.volSpike != null && intraday.volSpike >= 1.6) || (intraday.relVol != null && intraday.relVol >= 1.6)
+  );
   const justReclaim = Boolean(prev && last && vwap != null && prev.close < vwap && last.close >= vwap);
-  const nearVwap = vwap != null && Math.abs(px - vwap) <= atr * 1.4;
-  const taggedEma = Boolean(ema9 != null && last && last.low <= ema9 + atr * 0.3 && px >= Math.min(ema9, last.close));
-  const rsiBuy = rsi == null || (rsi >= 38 && rsi <= 72);
+  const taggedEma = Boolean(ema9 != null && last && last.low <= ema9 + atr * 0.55 && last.close >= ema9 - atr * 0.08);
+  const taggedEma21 = Boolean(ema21 != null && last && last.low <= ema21 + atr * 0.55 && last.close >= ema21 - atr * 0.1);
+  const taggedVwap = Boolean(vwap != null && last && last.low <= vwap + atr * 0.5 && last.close >= vwap - atr * 0.12);
+  const taggedOrh = Boolean(orh != null && last && last.low <= orh + atr * 0.4 && last.close >= orh);
+  const confirmBar = Boolean(last && prev && last.close >= last.open && last.close >= prev.close);
+  const recent = candles.slice(-12);
+  const swingHigh = recent.length > 3 ? Math.max(...recent.slice(0, -1).map((c) => c.high)) : null;
+  const pulled = Boolean(swingHigh && last && last.low <= swingHigh - Math.max(atr * 0.7, swingHigh * 0.004));
+  const chase = runner.ok && inWindow && overheated && chaseVol && confirmBar && aboveVwap
+    && rsiHot && (rsiTurn || macdAccel) && (rsi == null || rsi < 93);
+  const notChase = !overheated || chase;
+  const pullback = runner.ok && inWindow && confirmBar && pulled
+    && (taggedVwap || taggedEma || taggedEma21 || taggedOrh)
+    && (rsi == null || (rsi >= 35 && rsi <= 85))
+    && (volAlive || volExpand)
+    && (rsiTurn || stochTurn || macdAccel || last.close > prev.close);
 
+  const stacked = runner.ok && inWindow && notChase && confirmBar && volAlive && (chase ? rsiHot : rsiBuy);
   const allowBreak = mode === "pre" || mode === "full";
-  const pullback = inWindow && aboveVwap && trend && taggedEma && rsiBuy && notChase;
-  const vwapReclaim = inWindow && aboveVwap && (justReclaim || nearVwap) && rsiBuy && notChase && (trend || macdUp);
-  const orb = inWindow && allowBreak && orh != null && px >= orh && aboveVwap && volAlive && (rsi == null || rsi < 75) && notChase;
-  const continuation = inWindow && allowBreak && aboveVwap && trend && macdUp && rsiBuy && volAlive && notChase;
+  const orb = stacked && allowBreak && orh != null && last && last.close >= orh && aboveVwap && (rsi == null || rsi < (chase ? 93 : 84));
+  const vwapReclaim = stacked && aboveVwap && justReclaim && (volAlive || macdAccel);
+  const bounce = false;
+  const continuation = stacked && allowBreak && aboveVwap && volAlive && (trend || macdUp || macdAccel)
+    && vsVwapPct >= 0.2
+    && (chase ? vsVwapPct <= 15 : vsVwapPct <= 8)
+    && (chase
+      ? (preMode ? intraday.fromOpenPct < 40 : intraday.fromOpenPct < 25)
+      : (preMode ? intraday.fromOpenPct < 18 : intraday.fromOpenPct < 12));
 
   const newsOk = bias !== "악재 우세";
   const allowNewsBreak = newsOk && allowBreak;
@@ -1219,25 +1953,31 @@ function pickDayTactic(intraday, bias) {
   let label = "";
   if (pullback) {
     tactic = "pullback";
-    label = "EMA 눌림";
-  } else if (vwapReclaim) {
-    tactic = "vwap";
-    label = justReclaim ? "VWAP 회복" : "VWAP 근접";
+    label = taggedVwap ? "눌림목 · VWAP" : taggedOrh ? "눌림목 · PMH 지지" : "눌림목 · EMA";
   } else if (allowNewsBreak && orb) {
     tactic = "orb";
-    label = preMode ? "PMH 돌파" : "ORH 돌파";
+    label = preMode ? "급등 PMH 돌파" : "급등 ORH 돌파";
+  } else if (allowNewsBreak && chase) {
+    tactic = "chase";
+    label = "상승 과열 추적 · 거래량";
+  } else if (vwapReclaim) {
+    tactic = "vwap";
+    label = "급등 VWAP 회복";
   } else if (allowNewsBreak && continuation) {
     tactic = "trend";
-    label = "추세 지속";
+    label = chase ? "상승 과열 지속 · 거래량" : "급등 지속";
   }
 
   const fire = Boolean(tactic);
   const wait = [];
   if (!inWindow) wait.push(intraday.session?.current?.note || "매수 시간이 아닙니다.");
+  else if (!runner.ok) wait.push("대기: 급등 변동·거래량이 붙을 때까지. 대형 저변동은 보지 않습니다.");
   else {
-    if (!pullback) wait.push("대기: 분봉 저가가 EMA9을 찍고 다시 올라오면 눌림 매수");
-    if (!vwapReclaim) wait.push("대기: VWAP을 되밟거나 바로 위에서 받아내는 회복 매수");
-    if (allowBreak && !orb) wait.push(preMode ? "대기: 프장 15분 고점(PMH)을 거래량과 함께 돌파" : "대기: 시초 15분 고점(ORH)을 거래량과 함께 돌파");
+    if (!volAlive) wait.push("대기: 거래량이 평균보다 붙을 때까지");
+    if (overheated && !chaseVol) wait.push("대기: 상승 과열 · 거래량이 더 붙으면 추적");
+    if (!confirmBar) wait.push("대기: 전봉보다 높은 양봉 확인");
+    if (allowBreak && !orb) wait.push(preMode ? "대기: 프장 고점(PMH)을 거래량과 종가로 돌파" : "대기: 시초 고점(ORH)을 거래량과 종가로 돌파");
+    if (!pullback) wait.push("대기: 급등 후 VWAP·EMA·PMH까지 눌렸다가 양봉으로 반등");
   }
 
   return {
@@ -1250,8 +1990,19 @@ function pickDayTactic(intraday, bias) {
     notChase,
     pullback,
     vwapReclaim,
+    bounce,
+    chase,
     orb,
     continuation,
+    aboveVwap,
+    trend,
+    rsiBuy,
+    stochBuy,
+    macdUp,
+    volAlive,
+    stacked,
+    confirmBar,
+    runner: runner.ok,
     wait,
   };
 }
@@ -1261,7 +2012,7 @@ function buildTradeTicket(action, setup, px, intraday, tactic) {
   const fill = exec.price ?? roundPx(px);
   const lv = tacticLevels(intraday, fill, tactic);
   const allowed = action === "당일 롱 관심";
-  const tp = computeTakeProfit(intraday, { buyPrice: fill, sellPrice: lv.sellBase });
+  const tp = computeTakeProfit(intraday, { buyPrice: fill, sellPrice: lv.sellBase, stretch: lv.stretch });
   const liveStop = computeLiveStop(intraday, fill);
 
   let buyReason = `대기 호가 ${fill}. 지금은 ${action}.`;
@@ -1289,6 +2040,7 @@ function buildTradeTicket(action, setup, px, intraday, tactic) {
     sellPrice: tp.price,
     sellReason: tp.reason,
     sellAnchor: lv.sellBase,
+    sellStretch: lv.stretch,
     takeProfit: tp.price,
     takeProfitReason: tp.reason,
     stopPrice: lv.stopPrice,
@@ -1301,19 +2053,30 @@ function buildTradeTicket(action, setup, px, intraday, tactic) {
 function computeTakeProfit(intraday, locked) {
   const px = intraday.price;
   const rsi = intraday.rsi;
-  const atr = intraday.atr || px * 0.003;
-  const base = locked.sellPrice;
-  if (base == null || px == null) {
+  const stoch = intraday.stoch;
+  const buy = locked.buyPrice;
+  const t5 = locked.sellPrice ?? (buy != null ? roundPx(buy + horizonMove(intraday, buy, 5)) : null);
+  const t10 = locked.stretch ?? (buy != null ? roundPx(buy + horizonMove(intraday, buy, 10)) : null);
+  const elapsed = locked.since ? (Date.now() - Number(locked.since)) / 60000 : 0;
+  if (t5 == null || px == null) {
     return { price: null, reason: "익절가를 못 짰습니다." };
   }
-  if (rsi != null && rsi >= 75) {
-    return { price: roundPx(px), reason: `RSI ${rsi.toFixed(1)} 과열 — 단타 익절` };
+  if (elapsed >= 10) {
+    return { price: roundPx(px), reason: "10분 만료 — 청산. 그 이상 목표는 없습니다." };
   }
-  if (px > base) {
-    const trail = roundPx(Math.max(base, px - atr * 0.6));
-    return { price: trail, reason: `고점 추적 익절. RSI ${rsi?.toFixed?.(1) ?? "-"}` };
+  if (buy != null && t10 != null && px >= t10) {
+    return { price: roundPx(px), reason: "10분 목표 도달 — 익절" };
   }
-  return { price: roundPx(base), reason: "검색 시 매도가 유지. RSI 과열·신고가일 때만 익절가 조정" };
+  if (buy != null && px >= t5) {
+    return { price: roundPx(px), reason: "5분 목표 도달 — 익절. 더 길게 안 봅니다." };
+  }
+  if ((rsi != null && rsi >= 75) || (stoch != null && stoch >= 85)) {
+    return { price: roundPx(t5), reason: "과열 — 5분 1차만 보고 청산" };
+  }
+  if (elapsed >= 5 && t10 != null) {
+    return { price: roundPx(t10), reason: "5분 미달 · 10분 목표만 남음. 그 이상은 없음" };
+  }
+  return { price: roundPx(t5), reason: "1차 5분 익절 · 안 되면 10분 · 그 이상은 없음" };
 }
 
 function applyLockedTrade(plan, locked, intraday) {
@@ -1322,7 +2085,13 @@ function applyLockedTrade(plan, locked, intraday) {
   const buyPrice = locked.buyPrice != null ? locked.buyPrice : live.buyPrice;
   const stopPrice = locked.stopPrice != null ? locked.stopPrice : live.stopPrice;
   const sellAnchor = locked.sellAnchor != null ? locked.sellAnchor : (locked.sellPrice ?? live.sellAnchor ?? live.sellPrice);
-  const tp = computeTakeProfit(intraday, { buyPrice, sellPrice: sellAnchor });
+  const sellStretch = locked.sellStretch != null ? locked.sellStretch : (live.sellStretch ?? live.stretch);
+  const tp = computeTakeProfit(intraday, {
+    buyPrice,
+    sellPrice: sellAnchor,
+    stretch: sellStretch,
+    since: locked.since,
+  });
   const exec = executableLong(intraday.quote, intraday.price);
   const liveStop = computeLiveStop(intraday, exec.price ?? locked.buyPrice);
   plan.trade = {
@@ -1337,6 +2106,7 @@ function applyLockedTrade(plan, locked, intraday) {
     ask: exec.ask,
     spread: exec.spread,
     sellAnchor,
+    sellStretch,
     sellPrice: tp.price,
     sellReason: tp.reason,
     takeProfit: tp.price,
@@ -1366,20 +2136,22 @@ function dayTradePlan(intraday, bias) {
   const picked = pickDayTactic(intraday, bias);
   const preMode = picked.mode === "pre";
   const checks = [
-    { name: "EMA 눌림", ok: picked.pullback },
-    { name: "VWAP 회복", ok: picked.vwapReclaim },
+    { name: "급등 셋업", ok: picked.runner },
+    { name: "거래량 급증", ok: picked.volAlive },
+    { name: "양봉 확인", ok: picked.confirmBar },
+    { name: "VWAP 위", ok: picked.aboveVwap },
+    { name: "눌림목", ok: picked.pullback },
     { name: preMode ? "PMH 돌파" : "ORH 돌파", ok: picked.orb },
-    { name: "추세 지속", ok: picked.continuation },
-    { name: "추격 아님", ok: picked.notChase },
+    { name: "과열 추적", ok: Boolean(picked.chase) || picked.notChase },
     { name: "매수 시간", ok: picked.inWindow },
     { name: "뉴스 통과", ok: picked.newsOk },
   ];
 
   const reasons = [];
   const rules = [
-    "프장 단타가 주력. 정규장은 눌림·VWAP만 보조.",
-    "프장 15분 PMH 형성 후 돌파·VWAP·EMA. 정규 직전 20분·시초 15분·점심·마감은 신규 금지.",
-    "프장 스프레드는 ASK 지정. 손절 0.7 ATR, 1R에서 익절.",
+    "급등주 단타. 대형·저변동은 보지 않습니다.",
+    "거래량 붙은 PMH 돌파·VWAP 회복·눌림목. 5분 1차, 안 되면 10분 2차.",
+    "상승 과열은 거래량이 붙으면 추적. 거래량 빠지면 추격 금지.",
   ];
 
   let action = "관망";
@@ -1387,19 +2159,24 @@ function dayTradePlan(intraday, bias) {
 
   if (!picked.inWindow) {
     reasons.push(intraday.session?.current?.note || "매수 시간이 아닙니다.");
-  } else if (!picked.notChase) {
-    action = "추격 금지 / 되돌림 대기";
-    setup = "과열 추격 금지";
-    reasons.push(`RSI ${rsi?.toFixed?.(1) ?? "-"}, 시가대비 ${intraday.fromOpenPct.toFixed(2)}%. 눌림 올 때까지 안 삽니다.`);
+  } else if (!picked.runner) {
+    setup = "급등 셋업 아님";
+    reasons.push("대형주·저변동은 이 레이더 타점이 아닙니다. 거래량 붙은 급등주만 봅니다.");
   } else if (picked.fire) {
     action = "당일 롱 관심";
     setup = bias === "악재 우세" ? `축소 · ${picked.label}` : picked.label;
-    reasons.push(`${picked.label} 셋업입니다. ASK/시장가로 바로 진입하고 1R에서 익절합니다.`);
+    reasons.push(`${picked.label}. RSI ${rsi?.toFixed?.(1) ?? "-"} · 거래량 ${picked.volAlive ? "급증" : "약함"}. 5분 1차, 10분 2차.`);
+    if (picked.chase) reasons.push("거래량이 붙어 상승 과열을 5~10분 추적합니다. 거래량 빠지면 바로 중단.");
+    if (picked.pullback) reasons.push("급등 후 눌림목 반등입니다. 지지 깨지면 손절.");
     if (preMode) reasons.push("프장 주력 구간입니다. 스프레드를 보고 지정가로 넣습니다.");
     if (bias === "악재 우세") reasons.push("당일 악재가 있어 사이즈만 줄입니다. 돌파 추격은 하지 않습니다.");
-    if (picked.mode === "pullback") reasons.push("정규 보조 구간이라 돌파 추격 없이 눌림·VWAP만 탑니다.");
+    if (picked.mode === "pullback" && picked.tactic !== "pullback") reasons.push("정규 보조 구간이라 돌파 추격 없이 눌림·VWAP만 탑니다.");
+  } else if (!picked.notChase) {
+    action = "추격 금지 / 거래량 대기";
+    setup = "과열 · 거래량 없음";
+    reasons.push(`상승 과열(RSI ${rsi?.toFixed?.(1) ?? "-"}, 시가대비 ${intraday.fromOpenPct.toFixed(2)}%)이지만 거래량이 안 붙었습니다. 눌림목이나 거래량 급증을 기다립니다.`);
   } else {
-    setup = px < (intraday.vwap ?? px) ? "VWAP 아래 · 회복 대기" : "셋업 대기";
+    setup = !picked.volAlive ? "거래량 대기" : (px < (intraday.vwap ?? px) ? "VWAP 회복 대기" : "급등 타점 대기");
     reasons.push(...picked.wait.slice(0, 3));
   }
 
@@ -1470,29 +2247,30 @@ function candlePayload(chart) {
 }
 
 async function livePack(symbol, bias, locked) {
-  const [c1m, c1d, quote, tossBars] = await Promise.all([
+  const [c1m, c1d, quote, kiwoom] = await Promise.all([
     yahooChart(symbol, "1m", "2d").catch(() => null),
     yahooChart(symbol, "1d", "5d").catch(() => null),
     yahooQuote(symbol).catch(() => null),
-    tossMinuteBars(symbol).catch((err) => {
-      console.warn("toss candles:", err.message);
-      return [];
+    kiwoomSession(symbol).catch((err) => {
+      console.warn("kiwoom:", err.message);
+      return { bars: [], quote: null };
     }),
   ]);
   if (!c1m) throw new Error("1분봉을 못 가져왔습니다.");
   const chartQ = packQuote(c1m.meta);
+  const kw = kiwoom?.quote || {};
   const merged = {
-    last: quote?.last ?? chartQ?.last,
-    bid: quote?.bid,
-    ask: quote?.ask,
+    last: quote?.last ?? kw.last ?? chartQ?.last,
+    bid: quote?.bid || kw.bid,
+    ask: quote?.ask || kw.ask,
     bidSize: quote?.bidSize,
     askSize: quote?.askSize,
-    volume: quote?.volume,
+    volume: kw.volume || quote?.volume,
     marketState: quote?.marketState || c1m.meta?.marketState || chartQ?.marketState || "",
-    preMarketPrice: quote?.preMarketPrice ?? rawNum(c1m.meta?.preMarketPrice),
+    preMarketPrice: quote?.preMarketPrice ?? rawNum(c1m.meta?.preMarketPrice) ?? kw.last,
     postMarketPrice: quote?.postMarketPrice ?? rawNum(c1m.meta?.postMarketPrice),
   };
-  const intraday = buildIntraday(c1m, c1d, merged, tossBars);
+  const intraday = buildIntraday(c1m, c1d, merged, kiwoom?.bars || []);
   let plan = dayTradePlan(intraday, bias);
   if (locked?.buyPrice != null || locked?.sellPrice != null) {
     plan = applyLockedTrade(plan, locked, intraday);
@@ -1519,6 +2297,7 @@ async function livePack(symbol, bias, locked) {
       }
       : null,
     plan,
+    tape: kiwoom?.quote?.volume || (kiwoom?.bars || []).some((b) => b.v > 0) ? "kiwoom" : "yahoo",
   };
 }
 
@@ -1538,7 +2317,8 @@ function mapMover(q) {
   const changePct = rawNum(q.regularMarketChangePercent);
   const volume = rawNum(q.regularMarketVolume);
   const avgVol = rawNum(q.averageDailyVolume3Month) || rawNum(q.averageDailyVolume10Day);
-  const relVol = avgVol && volume != null ? volume / avgVol : null;
+  const stats = sessionVolumeStats(volume, avgVol);
+  const relVol = stats.relVol;
   const heat = changePct != null
     ? Number((changePct * Math.min(Math.max(relVol || 1, 0.5), 8)).toFixed(1))
     : changePct;
@@ -1551,7 +2331,9 @@ function mapMover(q) {
     changePct: changePct != null ? Number(changePct.toFixed(2)) : null,
     volume,
     avgVol,
-    relVol: relVol != null ? Number(relVol.toFixed(2)) : null,
+    relVol,
+    volSurgePct: stats.volSurgePct,
+    volDelta: stats.volDelta,
     marketCap: rawNum(q.marketCap),
     heat,
   };
@@ -1643,9 +2425,16 @@ async function listedUniverse() {
 async function yahooMinuteChart(symbol) {
   const url =
     `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}` +
-      "?interval=1m&range=1h&includePrePost=true&region=US&lang=en-US";
+      "?interval=1m&range=1d&includePrePost=true&region=US&lang=en-US";
   const data = await fetchJson(url);
   return data.chart?.result?.[0] || null;
+}
+
+function minuteHeat(pct, relVol) {
+  if (!Number.isFinite(Number(pct))) return null;
+  const rel = Number(relVol);
+  const mul = Number.isFinite(rel) && rel > 0 ? Math.min(Math.max(rel, 0.3), 8) : 1;
+  return Number((Number(pct) * mul).toFixed(1));
 }
 
 function lastMinuteStats(chart) {
@@ -1656,14 +2445,15 @@ function lastMinuteStats(chart) {
   if (now - last.t > 15 * 60) return null;
   const prev = all.at(-2);
   const withVol = all.filter((b) => b.v > 0);
-  const hist = withVol.slice(-16, -1);
-  const avgVol = hist.length ? hist.reduce((s, b) => s + b.v, 0) / hist.length : (last.v || null);
+  const print = withVol.at(-1) || last;
+  const hist = withVol.filter((b) => b.t < print.t).slice(-16);
+  const avgVol = hist.length ? hist.reduce((s, b) => s + b.v, 0) / hist.length : (print.v || null);
   const changePct = prev.c ? ((last.c - prev.c) / prev.c) * 100 : 0;
-  const hasPrint = last.v > 0;
-  const relVol = hasPrint && avgVol ? last.v / avgVol : null;
-  const volDelta = hasPrint && avgVol != null ? last.v - avgVol : null;
-  const volSurgePct = hasPrint && avgVol ? ((last.v - avgVol) / avgVol) * 100 : null;
-  const turnover = last.c * last.v;
+  const hasPrint = print.v > 0;
+  const relVol = hasPrint && avgVol ? print.v / avgVol : null;
+  const volDelta = hasPrint && avgVol != null ? print.v - avgVol : null;
+  const volSurgePct = hasPrint && avgVol ? ((print.v - avgVol) / avgVol) * 100 : null;
+  const turnover = last.c * (last.v || print.v || 0);
   return {
     price: last.c,
     change: last.c - prev.c,
@@ -1674,7 +2464,7 @@ function lastMinuteStats(chart) {
     volDelta: Number.isFinite(volDelta) ? Math.round(volDelta) : null,
     volSurgePct: volSurgePct != null ? Number(volSurgePct.toFixed(1)) : null,
     relVol: relVol != null ? Number(relVol.toFixed(2)) : null,
-    heat: Number((changePct * Math.min(Math.max(relVol || 1, 0.3), 8)).toFixed(1)),
+    heat: minuteHeat(changePct, relVol),
     minute: true,
   };
 }
@@ -1693,6 +2483,14 @@ async function mapLimit(items, limit, fn) {
   return out;
 }
 
+function isGainerName(row) {
+  const px = Number(row?.price);
+  const cap = Number(row?.marketCap);
+  if (Number.isFinite(px) && (px < 0.001 || px >= 80)) return false;
+  if (Number.isFinite(cap) && cap >= 20e9) return false;
+  return true;
+}
+
 function pickWatch(listed, q) {
   const watch = [];
   const seen = new Set();
@@ -1708,7 +2506,8 @@ function pickWatch(listed, q) {
       if (watch.length >= 80) break;
     }
   }
-  const byVol = [...listed].sort((a, b) => (b.volume || 0) - (a.volume || 0));
+  const pool = listed.filter(isGainerName);
+  const byVol = [...(pool.length ? pool : listed)].sort((a, b) => (b.volume || 0) - (a.volume || 0));
   for (const row of byVol) {
     add(row);
     if (watch.length >= (q ? 80 : 200)) break;
@@ -1721,8 +2520,29 @@ async function attachMinute(rows) {
     try {
       const chart = await yahooMinuteChart(row.symbol);
       const minute = lastMinuteStats(chart);
-      if (!minute) return null;
-      return { ...row, ...minute, name: row.name };
+      if (!minute) {
+        return {
+          ...row,
+          dayChangePct: row.dayChangePct ?? row.changePct ?? null,
+          minuteChangePct: row.minuteChangePct ?? null,
+          heat: minuteHeat(row.minuteChangePct, row.minuteRelVol),
+        };
+      }
+      return {
+        ...row,
+        ...minute,
+        name: row.name,
+        dayChangePct: row.dayChangePct ?? row.changePct ?? null,
+        minuteChangePct: minute.changePct,
+        minuteRelVol: minute.relVol ?? null,
+        heat: minuteHeat(minute.changePct, minute.relVol),
+        changePct: row.changePct ?? minute.changePct,
+        volume: row.volume || minute.volume,
+        turnover: row.turnover || (row.price && row.volume ? row.price * row.volume : minute.turnover),
+        volSurgePct: row.volSurgePct ?? minute.volSurgePct ?? sessionVolumeStats(row.volume || minute.volume, row.avgVol).volSurgePct,
+        volDelta: row.volDelta ?? minute.volDelta ?? sessionVolumeStats(row.volume || minute.volume, row.avgVol).volDelta,
+        avgVol: row.avgVol ?? minute.avgVol,
+      };
     } catch {
       return null;
     }
@@ -1730,17 +2550,94 @@ async function attachMinute(rows) {
   return mapped.filter(Boolean);
 }
 
+async function attachMinuteChange(rows) {
+  const session = tapeSessionNow();
+  const mapped = await mapLimit(rows, 12, async (row) => {
+    try {
+      const chart = await yahooMinuteChart(row.symbol);
+      const rthClose = rthCloseFromChart(chart);
+      if (rthClose) rememberRthClose(row.symbol, rthClose);
+      const minute = lastMinuteStats(chart);
+      const price = minute?.price || row.price;
+      const afterPct = (session === "POST" || (session === "CLOSED" && rthClose))
+        ? (pctFromClose(price, rthClose) ?? 0)
+        : null;
+      if (!minute) {
+        return {
+          ...row,
+          minuteChangePct: row.minuteChangePct ?? null,
+          heat: minuteHeat(row.minuteChangePct, row.minuteRelVol),
+          ...(afterPct != null ? { dayChangePct: afterPct, changePct: afterPct } : {}),
+        };
+      }
+      return {
+        ...row,
+        minuteChangePct: minute.changePct,
+        minuteRelVol: minute.relVol ?? null,
+        heat: minuteHeat(minute.changePct, minute.relVol),
+        price: row.price || minute.price,
+        ...(afterPct != null ? { dayChangePct: afterPct, changePct: afterPct } : {}),
+      };
+    } catch {
+      return {
+        ...row,
+        minuteChangePct: row.minuteChangePct ?? null,
+        heat: minuteHeat(row.minuteChangePct, row.minuteRelVol),
+      };
+    }
+  });
+  return mapped.filter(Boolean);
+}
+
 async function usGainers(params) {
-  const listed = await listedUniverse();
+  resetUsBoardIfNewEtDay();
+  const session = tapeSessionNow();
+  const listed = await listedUniverse().catch(() => []);
   const q = String(params?.get?.("q") || "").trim();
-  if (!q && Date.now() - minuteCache.at < 20000 && minuteCache.rows.length) {
-    return minuteCache.rows;
+  const kw = await kiwoomVolumeBoard().catch((err) => {
+    console.warn("kiwoom board:", err.message);
+    return { at: 0, rows: [], basis: "" };
+  });
+  const byKiwoom = session === "CLOSED";
+  if (kw.rows.length) {
+    let rows = kw.rows;
+    if (q) {
+      const needle = q.toLowerCase();
+      rows = rows.filter((r) => `${r.symbol} ${r.name}`.toLowerCase().includes(needle));
+    }
+    if (rows.length) {
+      if (!q && Date.now() - minuteCache.at < 20000 && minuteCache.rows[0]?.source) {
+        return liveBoardRows(minuteCache.rows);
+      }
+      if (!byKiwoom) {
+        rows = await attachMinuteChange(rows.slice(0, 80));
+        rows.sort((a, b) => (b.minuteChangePct ?? -999) - (a.minuteChangePct ?? -999) || (a.kiwoomRank ?? 9999) - (b.kiwoomRank ?? 9999));
+      } else {
+        rows = rows.slice(0, 80);
+        rows.sort((a, b) => (a.kiwoomRank ?? 9999) - (b.kiwoomRank ?? 9999));
+      }
+      minuteCache = { at: Date.now(), rows };
+      return liveBoardRows(rows);
+    }
   }
-  if (q) return attachMinute(pickWatch(listed, q));
-  const rows = await attachMinute(pickWatch(listed, ""));
-  rows.sort((a, b) => (b.changePct ?? -999) - (a.changePct ?? -999));
+  if (!q && Date.now() - minuteCache.at < 20000 && minuteCache.rows.length) {
+    return liveBoardRows(minuteCache.rows);
+  }
+  const universe = listed.length ? listed : kw.rows;
+  const watch = pickWatch(universe, q);
+  const attached = await attachMinute(watch);
+  const rows = attached.map((row) => ({
+    ...row,
+    dayChangePct: row.dayChangePct ?? row.changePct ?? null,
+    minuteChangePct: row.minuteChangePct ?? (row.minute ? row.changePct : null),
+    heat: minuteHeat(
+      row.minuteChangePct ?? (row.minute ? row.changePct : null),
+      row.minuteRelVol ?? (row.minute ? row.relVol : null),
+    ),
+  }));
+  rows.sort((a, b) => (b.minuteChangePct ?? -999) - (a.minuteChangePct ?? -999) || (b.volSurgePct ?? -1) - (a.volSurgePct ?? -1));
   minuteCache = { at: Date.now(), rows };
-  return rows;
+  return liveBoardRows(rows);
 }
 
 function filterGainers(rows, params) {
@@ -1752,13 +2649,14 @@ function filterGainers(rows, params) {
   const minRel = Number(params.get("minRel") ?? 0);
   const minTurnover = Number(params.get("minTurnover") ?? 0);
   const limit = Math.min(Number(params.get("limit") ?? 200) || 200, 400);
-  const sort = params.get("sort") || "pct";
+  const sort = params.get("sort") || "min1";
   const filtered = rows.filter((r) => {
     if (q) {
       const hay = `${r.symbol} ${r.name}`.toLowerCase();
       if (!hay.includes(q)) return false;
-    } else if (r.changePct == null || r.changePct < minPct) {
-      return false;
+    } else if (minPct > 0) {
+      const dayPct = r.dayChangePct ?? r.changePct;
+      if (dayPct == null || dayPct < minPct) return false;
     }
     if (minVol > 0 && (r.volume == null || r.volume < minVol)) return false;
     if (minTurnover > 0 && (r.turnover == null || r.turnover < minTurnover)) return false;
@@ -1769,11 +2667,17 @@ function filterGainers(rows, params) {
   });
   const key = sort === "heat" ? "heat"
     : sort === "volume" ? "volume"
-    : sort === "rel" || sort === "surge" ? "volSurgePct"
+    : sort === "rel" ? "relVol"
+    : sort === "surge" ? "volSurgePct"
     : sort === "delta" ? "volDelta"
     : sort === "turnover" ? "turnover"
-    : "changePct";
-  filtered.sort((a, b) => (b[key] ?? -999) - (a[key] ?? -999));
+    : sort === "min1" ? "minuteChangePct"
+    : "dayChangePct";
+  if (tapeSessionNow() === "CLOSED" && (sort === "min1" || sort === "kiwoom")) {
+    filtered.sort((a, b) => (a.kiwoomRank ?? 9999) - (b.kiwoomRank ?? 9999));
+  } else {
+    filtered.sort((a, b) => (b[key] ?? -999) - (a[key] ?? -999));
+  }
   return filtered.slice(0, limit);
 }
 
@@ -1853,16 +2757,19 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/gainers") {
       const rows = await usGainers(url.searchParams);
       const items = filterGainers(rows, url.searchParams);
+      const session = tapeSessionNow();
       return json(res, 200, {
-        asOf: new Date(minuteCache.at || Date.now()).toISOString(),
+        asOf: new Date().toISOString(),
         market: "US",
-        session: tapeSessionNow(),
-        basis: "1m",
+        session,
+        etDay: etDateKey(),
+        basis: session === "CLOSED" ? "kiwoom" : "1m",
         universe: listedCache.rows.length || rows.length,
         scanned: rows.length,
         count: items.length,
+        source: rows[0]?.source ? "kiwoom" : "yahoo",
         items,
-        disclaimer: "1분봉 등락·거래량·거래대금 기준입니다. 지연 시세이며 투자 권유가 아닙니다.",
+        disclaimer: "키움 거래량급증·당일 거래량 상위 기준입니다. 지연 시세이며 투자 권유가 아닙니다.",
       });
     }
     if (url.pathname === "/api/scan") {
@@ -1875,7 +2782,9 @@ const server = http.createServer(async (req, res) => {
       const locked = {
         buyPrice: Number(url.searchParams.get("buy")) || null,
         sellPrice: Number(url.searchParams.get("sell")) || null,
+        sellStretch: Number(url.searchParams.get("sell10")) || null,
         stopPrice: Number(url.searchParams.get("stop")) || null,
+        since: Number(url.searchParams.get("since")) || null,
         buyReason: url.searchParams.get("buyReason") || "",
         sellReason: url.searchParams.get("sellReason") || "",
         stopReason: url.searchParams.get("stopReason") || "",
