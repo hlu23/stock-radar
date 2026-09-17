@@ -4,31 +4,31 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Stock Radar V2 — 미장 급등주</title>
-    <link rel="stylesheet" href="/styles.css?v=2" />
+    <link rel="stylesheet" href="/styles.css?v=2.8" />
   </head>
   <body>
     <main class="shell">
       <header class="top">
         <div>
-          <p class="eyebrow">Stock Radar V2 · US movers</p>
+          <p class="eyebrow">Stock Radar V2 · Yahoo 무료</p>
           <h1>미장 급등주 레이더</h1>
         </div>
-        <p class="note">미장 <strong>프장 단타</strong>가 주력입니다. 정규장은 눌림만 보조로 봅니다. 급등 보드는 직전 1분봉 기준입니다.</p>
+        <p class="note">미장 <strong>프장 급등주</strong> 단타. 차트·거래량은 야후 파이낸스. 5분 1차 · 10분 2차.</p>
       </header>
 
       <section class="board" id="board">
         <div class="board-head">
           <div>
-            <h2>1분 급등주</h2>
+            <h2>야후 급등주</h2>
             <p id="board-status" class="meta">스크리너 연결 중…</p>
           </div>
           <button type="button" id="refresh-gainers" class="ghost">새로고침</button>
         </div>
         <div class="filters" id="filters">
           <label>종목 검색
-            <input id="board-q" type="search" placeholder="티커 또는 회사명 (예: NVDA, semiconductor)" autocomplete="off" />
+            <input id="board-q" type="search" placeholder="티커 또는 회사명 (예: 급등 소형주)" autocomplete="off" />
           </label>
-          <label>1분 등락
+          <label>하루 등락
             <select id="minPct">
               <option value="0" selected>전체</option>
               <option value="0.3">+0.3%</option>
@@ -39,20 +39,24 @@
               <option value="5">+5%</option>
             </select>
           </label>
-          <label>1분 거래량
+          <label>거래량
             <select id="minVol">
-              <option value="0" selected>전체</option>
-              <option value="1000">1천</option>
-              <option value="5000">5천</option>
-              <option value="10000">1만</option>
-              <option value="50000">5만</option>
-              <option value="100000">10만</option>
+              <option value="0">전체</option>
+              <option value="5000000" selected>5M</option>
+              <option value="10000000">10M</option>
+              <option value="20000000">20M</option>
+              <option value="30000000">30M</option>
+              <option value="50000000">50M</option>
+              <option value="100000000">100M</option>
             </select>
           </label>
-          <label>1분 거래대금
+          <label>거래대금
             <select id="minTurnover">
               <option value="0" selected>전체</option>
               <option value="100000">10만$</option>
+              <option value="50000">5만$</option>
+              <option value="30000">3만$</option>
+              <option value="10000">1만$</option>
               <option value="500000">50만$</option>
               <option value="1000000">100만$</option>
               <option value="5000000">500만$</option>
@@ -61,22 +65,23 @@
           <label>최소 주가
             <select id="minPrice">
               <option value="0">전체</option>
-              <option value="1" selected>$1</option>
+              <option value="0.001" selected>$0.001</option>
+              <option value="1">$1</option>
               <option value="5">$5</option>
               <option value="10">$10</option>
             </select>
           </label>
           <label>가격 미만
             <select id="maxPrice">
-              <option value="0" selected>제한 없음</option>
+              <option value="0">제한 없음</option>
               <option value="5">$5</option>
               <option value="10">$10</option>
               <option value="20">$20</option>
-              <option value="50">$50</option>
+              <option value="50" selected>$50</option>
               <option value="100">$100</option>
             </select>
           </label>
-          <label>1분 상대거래량
+          <label>상대거래량
             <select id="minRel">
               <option value="0" selected>전체</option>
               <option value="1.5">1.5배+</option>
@@ -86,13 +91,14 @@
           </label>
           <label>정렬
             <select id="sortBy">
-              <option value="pct" selected>1분 등락</option>
-              <option value="volume">1분 거래량</option>
-              <option value="turnover">1분 거래대금</option>
-              <option value="heat">급등점수</option>
+              <option value="min1" selected>1분 등락</option>
               <option value="surge">거래량 급증률</option>
-              <option value="delta">거래량 증가</option>
-              <option value="rel">1분 상대거래량</option>
+              <option value="volume">거래량</option>
+              <option value="turnover">거래대금</option>
+              <option value="pct">하루 등락</option>
+              <option value="heat">1분 점수</option>
+              <option value="delta">1분 거래량</option>
+              <option value="rel">상대거래량</option>
             </select>
           </label>
         </div>
@@ -104,16 +110,17 @@
                 <th>티커</th>
                 <th>종목</th>
                 <th class="num">가격</th>
+                <th class="num" id="col-day">하루 등락</th>
                 <th class="num">1분 등락</th>
-                <th class="num">1분 거래량</th>
+                <th class="num">거래량</th>
                 <th class="num">급증률</th>
-                <th class="num">거래량 증가</th>
-                <th class="num">1분 거래대금</th>
-                <th class="num">점수</th>
+                <th class="num">1분 거래량</th>
+                <th class="num">거래대금</th>
+                <th class="num">1분 점수</th>
               </tr>
             </thead>
             <tbody id="gainers-body">
-              <tr><td colspan="10" class="empty">급등주를 불러오는 중…</td></tr>
+              <tr><td colspan="11" class="empty">급등주를 불러오는 중…</td></tr>
             </tbody>
           </table>
         </div>
@@ -125,7 +132,7 @@
           id="query"
           name="q"
           type="search"
-          placeholder="티커 직접 검색: AAPL, NVDA, TSLA…"
+          placeholder="티커 직접 검색: 급등 소형주 티커"
           autocomplete="off"
           required
         />
@@ -135,6 +142,20 @@
       <div id="buy-alert" class="buy-alert" hidden>
         <p class="buy-alert-title">매수 매수</p>
         <p id="buy-alert-detail" class="buy-alert-detail"></p>
+        <div class="buy-alert-levels">
+          <div class="alert-level">
+            <span>타점</span>
+            <strong id="alert-buy-price">-</strong>
+          </div>
+          <div class="alert-level">
+            <span>5분 / 10분</span>
+            <strong id="alert-sell-price">-</strong>
+          </div>
+          <div class="alert-level stop">
+            <span>손절</span>
+            <strong id="alert-stop-price">-</strong>
+          </div>
+        </div>
       </div>
 
       <p id="status" class="status">미국 티커를 검색하세요.</p>
@@ -149,6 +170,16 @@
             <p id="price" class="price"></p>
             <p id="change" class="change"></p>
           </div>
+          <div class="size-box">
+            <div class="size-item">
+              <span>주식수</span>
+              <strong id="shares-out">-</strong>
+            </div>
+            <div class="size-item">
+              <span>시가총액</span>
+              <strong id="market-cap">-</strong>
+            </div>
+          </div>
           <div id="condition" class="badge"></div>
         </article>
 
@@ -156,34 +187,6 @@
           <p id="session-now" class="session-now"></p>
           <ul id="session-slots" class="session-slots"></ul>
         </article>
-
-        <div class="tickets" id="tickets">
-          <article class="ticket buy-live" hidden>
-            <p class="ticket-label">매수 (실시간 ASK)</p>
-            <p id="buy-live-price" class="ticket-price">-</p>
-            <p id="buy-live-reason" class="ticket-reason"></p>
-          </article>
-          <article class="ticket buy">
-            <p class="ticket-label">매수</p>
-            <p id="buy-price" class="ticket-price">-</p>
-            <p id="buy-reason" class="ticket-reason"></p>
-          </article>
-          <article class="ticket sell">
-            <p class="ticket-label">매도 / 익절</p>
-            <p id="sell-price" class="ticket-price">-</p>
-            <p id="sell-reason" class="ticket-reason"></p>
-          </article>
-          <article class="ticket stop-live" hidden>
-            <p class="ticket-label">손절 (실시간)</p>
-            <p id="stop-live-price" class="ticket-price">-</p>
-            <p id="stop-live-reason" class="ticket-reason"></p>
-          </article>
-          <article class="ticket stop">
-            <p class="ticket-label">손절</p>
-            <p id="stop-price" class="ticket-price">-</p>
-            <p id="stop-reason" class="ticket-reason"></p>
-          </article>
-        </div>
 
         <div class="stage">
           <div class="chart-wrap">
@@ -194,13 +197,18 @@
                   <span class="lg pre">프리</span>
                   <span class="lg rth">본장</span>
                   <span class="lg post">애프터</span>
+                  <span class="lg vol">아래 막대 거래량</span>
                 </p>
               </div>
               <p id="chart-live" class="meta">시세 연결 대기</p>
             </div>
             <div class="chart-box">
               <div id="chart"></div>
+              <div id="chart-vol"></div>
               <div id="chart-tip" class="chart-tip" hidden></div>
+            </div>
+            <div class="chart-foot">
+              <button type="button" id="reset-buy-marks" class="ghost chart-reset" disabled>화살표 리셋</button>
             </div>
           </div>
 
@@ -237,6 +245,6 @@
       </section>
     </main>
     <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
-    <script src="/app.js?v=2"></script>
+    <script src="/app.js?v=4.4"></script>
   </body>
 </html>
