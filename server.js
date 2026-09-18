@@ -154,6 +154,8 @@ const volumeTape = new Map();
 let liveKickBusy = false;
 let yahooQuoteCursor = 0;
 let boardEtDay = "";
+let lastChartSymbol = "";
+let livePumpStarted = false;
 
 function etDateKey(d = new Date()) {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(d);
@@ -397,7 +399,20 @@ async function liveBoardRows(rows) {
   if (!rows?.length) return rows;
   await applyYahooLive(rows).catch(() => {});
   kickYahooLive(rows);
+  startYahooLivePump();
   return overlayLiveBoard(rows);
+}
+
+function startYahooLivePump() {
+  if (livePumpStarted) return;
+  livePumpStarted = true;
+  setInterval(() => {
+    const rows = [...(minuteCache.rows || [])];
+    if (lastChartSymbol && !rows.some((r) => r.symbol === lastChartSymbol)) {
+      rows.unshift({ symbol: lastChartSymbol });
+    }
+    if (rows.length) kickYahooLive(rows);
+  }, 1000);
 }
 
 function minuteTape(symbol, quoteVol, barTs) {
@@ -2499,6 +2514,7 @@ const server = http.createServer(async (req, res) => {
       const symbol = url.searchParams.get("symbol") || "";
       const bias = url.searchParams.get("bias") || "중립";
       if (!symbol) throw new Error("symbol 필요");
+      lastChartSymbol = String(symbol).toUpperCase().split(".")[0];
       const locked = {
         buyPrice: Number(url.searchParams.get("buy")) || null,
         sellPrice: Number(url.searchParams.get("sell")) || null,
