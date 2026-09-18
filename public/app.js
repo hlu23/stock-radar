@@ -235,6 +235,11 @@ function fmtAmt(n) {
 
 loadGainers({ resetPage: true });
 gainerTimer = setInterval(() => loadGainers(), 1000);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  loadGainers();
+  if (activeSymbol) refreshChart();
+});
 
 async function runScan(q) {
   statusEl.textContent = `"${q}" 해외 뉴스·1분봉 수집 중…`;
